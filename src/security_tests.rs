@@ -156,6 +156,10 @@ fn image_content_cannot_choose_the_decoder() {
 
 #[test]
 fn svg_cannot_read_local_files_through_coders() {
+    if !has_program("rsvg-convert") {
+        eprintln!("skipped: SVG input needs rsvg-convert");
+        return;
+    }
     let (_root, secret, input) = sandbox();
     let svg = |href: &str| {
         format!(
@@ -313,4 +317,12 @@ fn a_dangling_link_is_never_an_output_name() {
     std::os::unix::fs::symlink(root.path().join("home/planted"), input.join("a.jpg")).unwrap();
     let mut names = Names::default();
     assert_eq!(names.claim(&input, "a", "jpg").unwrap(), input.join("a (2).jpg"));
+}
+
+#[test]
+fn svg_needs_rsvg_convert() {
+    let svg = vec![PathBuf::from("/x/drawing.svg")];
+    let missing = missing_programs(Op::Convert("png"), &svg);
+    assert_eq!(missing.contains(&"rsvg-convert".to_string()), !has_program("rsvg-convert"));
+    assert!(!missing_programs(Op::Tool(Tool::Zip), &svg).contains(&"rsvg-convert".to_string()));
 }

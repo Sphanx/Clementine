@@ -1161,6 +1161,10 @@ pub fn missing_programs(op: Op, files: &[PathBuf]) -> Vec<String> {
     if matches!(op, Op::Tool(Tool::SplitMedia | Tool::FadeAudio)) {
         programs.push("ffprobe".into());
     }
+    // ImageMagick reads SVG through librsvg's rsvg-convert.
+    if programs.iter().any(|p| p == magick()) && files.iter().any(|f| extension(f) == "svg") {
+        programs.push("rsvg-convert".into());
+    }
     // ImageMagick writes HEIC and AVIF through libheif, whose encoders are separate packages.
     let mut plugins = Vec::new();
     if let Op::Convert(target) = op
