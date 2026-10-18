@@ -306,3 +306,11 @@ fn the_office_profile_pins_macros_off() {
     assert!(text.contains("\"Keep\"") && text.trim_end().ends_with("</oor:items>"));
     assert_eq!(text.matches("MacroSecurityLevel").count(), 1);
 }
+
+#[test]
+fn a_dangling_link_is_never_an_output_name() {
+    let (root, _secret, input) = sandbox();
+    std::os::unix::fs::symlink(root.path().join("home/planted"), input.join("a.jpg")).unwrap();
+    let mut names = Names::default();
+    assert_eq!(names.claim(&input, "a", "jpg"), input.join("a (2).jpg"));
+}

@@ -85,7 +85,8 @@ impl Names {
             let base = if n == 1 { stem.to_string() } else { format!("{stem} ({n})") };
             let name = if ext.is_empty() { base } else { format!("{base}.{ext}") };
             let path = dir.join(name);
-            if !path.exists() && !self.taken.contains(&path) {
+            // `symlink_metadata`: a dangling link is taken too, or a converter would write through it.
+            if std::fs::symlink_metadata(&path).is_err() && !self.taken.contains(&path) {
                 self.taken.insert(path.clone());
                 return path;
             }
