@@ -172,7 +172,9 @@ fn svg_cannot_read_local_files_through_coders() {
     let render = |name: &str| {
         run(Op::Convert("bmp"), &[input.join(name)], None, None).ok().map(|o| std::fs::read(&o[0]).unwrap())
     };
-    let plain = render("plain.svg").expect("a plain SVG converts");
+    let plain = run(Op::Convert("bmp"), &[input.join("plain.svg")], None, None)
+        .map(|o| std::fs::read(&o[0]).unwrap())
+        .unwrap_or_else(|e| panic!("a plain SVG converts: {e:#}"));
     if let Some(evil) = render("evil.svg") {
         assert_eq!(evil, plain, "the SVG drew the text of a local file");
     }
