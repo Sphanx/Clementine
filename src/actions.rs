@@ -134,10 +134,17 @@ fn open_terminal(dir: &Path) -> Option<String> {
 pub fn transfer(files: &[PathBuf], dest: &Path, moving: bool) -> std::io::Result<()> {
     for f in files {
         let Some(name) = f.file_name() else { continue };
+        if std::fs::symlink_metadata(f)?.is_dir() && dest.canonicalize()?.starts_with(f.canonicalize()?) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("cannot put {} inside itself", f.display()),
+            ));
+        }
         let mut to = dest.join(name);
         let (stem, ext) = split_name(&name.to_string_lossy());
         let mut n = 2;
-        while to.exists() {
+        // `symlink_metadata`: a dangling link counts as taken, so nothing is written through it.
+        while std::fs::symlink_metadata(&to).is_ok() {
             to = dest.join(format!("{stem} ({n}){ext}"));
             n += 1;
         }
@@ -146,7 +153,7 @@ pub fn transfer(files: &[PathBuf], dest: &Path, moving: bool) -> std::io::Result
         }
         copy_recursive(f, &to)?;
         if moving {
-            if f.is_dir() { std::fs::remove_dir_all(f)? } else { std::fs::remove_file(f)? }
+            if std::fs::symlink_metadata(f)?.is_dir() { std::fs::remove_dir_all(f)? } else { std::fs::remove_file(f)? }
         }
     }
     Ok(())
@@ -159,16 +166,24 @@ fn split_name(name: &str) -> (String, String) {
     }
 }
 
+/// Copies a file or folder; links are copied as links, never followed (a link to `.` would loop,
+/// and a link out of a downloaded folder would copy whatever it names).
 fn copy_recursive(from: &Path, to: &Path) -> std::io::Result<()> {
-    if from.is_dir() {
-        std::fs::create_dir_all(to)?;
+    let kind = std::fs::symlink_metadata(from)?.file_type();
+    if kind.is_symlink() {
+        std::os::unix::fs::symlink(std::fs::read_link(from)?, to)
+    } else if kind.is_dir() {
+        std::fs::create_dir(to)?;
         for entry in std::fs::read_dir(from)? {
             let entry = entry?;
             copy_recursive(&entry.path(), &to.join(entry.file_name()))?;
         }
         Ok(())
     } else {
-        std::fs::copy(from, to).map(|_| ())
+        // `create_new`: never write through something that appeared at `to` meanwhile.
+        let mut out = std::fs::OpenOptions::new().write(true).create_new(true).open(to)?;
+        std::io::copy(&mut std::fs::File::open(from)?, &mut out)?;
+        out.set_permissions(std::fs::metadata(from)?.permissions())
     }
 }
 
@@ -187,6 +202,51 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dst.path().join("a.txt")).unwrap(), "old");
         assert_eq!(std::fs::read_to_string(dst.path().join("a (2).txt")).unwrap(), "new");
         assert!(!a.exists());
+    }
+
+    #[test]
+    fn links_are_copied_as_links() {
+        let root = tempfile::tempdir().unwrap();
+        let secret = root.path().join("secret");
+        std::fs::create_dir(&secret).unwrap();
+        std::fs::write(secret.join("key"), "SENTINEL").unwrap();
+        let dir = root.path().join("download");
+        std::fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(&secret, dir.join("link")).unwrap();
+        std::os::unix::fs::symlink(".", dir.join("loop")).unwrap();
+        let dst = root.path().join("dst");
+        std::fs::create_dir(&dst).unwrap();
+        transfer(std::slice::from_ref(&dir), &dst, false).unwrap();
+        for name in ["link", "loop"] {
+            let copied = dst.join("download").join(name);
+            assert!(std::fs::symlink_metadata(&copied).unwrap().file_type().is_symlink(), "{name} was followed");
+        }
+    }
+
+    #[test]
+    fn a_dangling_link_at_the_destination_is_not_written_through() {
+        let root = tempfile::tempdir().unwrap();
+        let a = root.path().join("a.txt");
+        std::fs::write(&a, "new").unwrap();
+        let dst = root.path().join("dst");
+        std::fs::create_dir(&dst).unwrap();
+        let elsewhere = root.path().join("elsewhere.txt");
+        std::os::unix::fs::symlink(&elsewhere, dst.join("a.txt")).unwrap();
+        transfer(std::slice::from_ref(&a), &dst, false).unwrap();
+        assert!(!elsewhere.exists(), "the copy followed a link at the destination");
+        assert_eq!(std::fs::read_to_string(dst.join("a (2).txt")).unwrap(), "new");
+    }
+
+    #[test]
+    fn a_folder_is_never_moved_into_itself() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("photos");
+        std::fs::create_dir_all(dir.join("inner")).unwrap();
+        std::fs::write(dir.join("x"), "x").unwrap();
+        for moving in [true, false] {
+            assert!(transfer(std::slice::from_ref(&dir), &dir.join("inner"), moving).is_err());
+            assert!(dir.join("x").is_file() && !dir.join("inner/photos").exists());
+        }
     }
 
     #[test]

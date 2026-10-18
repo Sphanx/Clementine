@@ -1,0 +1,30 @@
+# Susen service menu for PDF (Dolphin / KDE Frameworks 6).
+# See README.md > File managers.
+[Desktop Entry]
+Type=Service
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
+MimeType=application/pdf;
+Actions=topng;tojpg;totxt;compress;
+X-KDE-Priority=TopLevel
+X-KDE-Submenu=Susen
+X-KDE-Protocols=file
+
+[Desktop Action topng]
+Name=Convert to PNG
+Icon=io.github.sphanx.Susen
+Exec=susen --convert png --notify -- %F
+
+[Desktop Action tojpg]
+Name=Convert to JPG
+Icon=io.github.sphanx.Susen
+Exec=susen --convert jpg --notify -- %F
+
+[Desktop Action totxt]
+Name=Convert to TXT
+Icon=io.github.sphanx.Susen
+Exec=susen --convert txt --notify -- %F
+
+[Desktop Action compress]
+Name=Compress
+Icon=io.github.sphanx.Susen
+Exec=susen --tool compress --notify -- %F

@@ -1,0 +1,8 @@
+[Nemo Action]
+Name=Open in Susen wheel…
+Comment=Choose a conversion on the Susen wheel
+Exec=susen --wheel -- %F
+Icon-Name=io.github.sphanx.Susen
+Selection=notnone
+Extensions=nodirs;
+Dependencies=susen;
