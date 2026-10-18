@@ -22,6 +22,7 @@ use std::process::Command as Process;
 use crate::backend;
 use crate::catalog::{Mode, Op, Tool, canonical, options};
 use crate::config;
+use crate::params::{self, Crop, Params, Resize, SplitBy};
 
 /// The hint passed to `GApplication::open` so the window opens the Convert wheel.
 pub const WHEEL_HINT: &str = "wheel";
@@ -34,11 +35,23 @@ Usage:
   clementine --tool TOOL FILE…       run a tool and print the results
   clementine --list FILE…            print the options for these files, one per line
 
-Tools: compress, resize, rotate, strip-metadata, half-size, mute, normalize, split, merge,
-extract, zip (each only where it applies).
+Tools (each only where it applies): compress, resize, crop, rotate, strip-metadata, half-size,
+mute, thumbnail, normalize, mono, fade, trim, split, speed, merge, pages, extract, zip.
 
---list prints `id<TAB>label`, plus `<TAB>unavailable: missing <programs>` when a program the
-option needs is not installed.
+Tools that ask for settings in the window take them as flags here; a flag left out keeps the
+window's default (resize 50%, split into 2 parts, speed 2×…):
+  trim       --start TIME --end TIME          (TIME: 90, 1:30, 1:02:03.5)
+  split      --parts N | --every TIME         (audio, video; PDF split needs nothing)
+  thumbnail  --at TIME
+  speed      --speed 0.25…4
+  fade       --fade-in TIME --fade-out TIME
+  resize     --percent N | --fit WxH
+  crop       --aspect W:H | --rect X,Y,W,H
+  rotate     --degrees 90|180|270             (PDF; images always turn 90°)
+  pages      --pages FIRST-LAST
+
+--list prints `id<TAB>label`, then `<TAB>params` for a tool that takes the flags above, and
+`<TAB>unavailable: missing <programs>` when a program the option needs is not installed.
 
 --notify (with --convert or --tool) also shows the result as a desktop notification.
 Exit status: 0 on success, 1 when a conversion fails, 2 on a usage error.";
@@ -47,7 +60,7 @@ Exit status: 0 on success, 1 when a conversion fails, 2 on a usage error.";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Convert { target: String, files: Vec<PathBuf>, notify: bool },
-    Tool { name: String, files: Vec<PathBuf>, notify: bool },
+    Tool { name: String, files: Vec<PathBuf>, notify: bool, params: Vec<(String, String)> },
     List { files: Vec<PathBuf> },
     Wheel { files: Vec<PathBuf> },
     Help,
@@ -68,6 +81,7 @@ pub fn parse(args: &[OsString]) -> Result<Option<Command>, String> {
     let mut mode: Option<Command> = None;
     let mut files = Vec::new();
     let mut notify = false;
+    let mut settings: Vec<(String, String)> = Vec::new();
     let mut only_files = false;
     let mut it = args.iter();
     // A Clementine flag must come first, so `clementine --convert.png` (a file) still opens the GUI.
@@ -102,7 +116,12 @@ pub fn parse(args: &[OsString]) -> Result<Option<Command>, String> {
             }
             "--help" | "-h" => Command::Help,
             "--convert" => Command::Convert { target: value("--convert")?, files: Vec::new(), notify: false },
-            "--tool" => Command::Tool { name: value("--tool")?, files: Vec::new(), notify: false },
+            "--tool" => Command::Tool { name: value("--tool")?, files: Vec::new(), notify: false, params: Vec::new() },
+            f if PARAM_FLAGS.contains(&f) => {
+                let v = value(f)?;
+                settings.push((f.trim_start_matches('-').to_string(), v));
+                continue;
+            }
             "--list" => Command::List { files: Vec::new() },
             "--wheel" => Command::Wheel { files: Vec::new() },
             other => return Err(format!("unknown option {other}")),
@@ -115,11 +134,19 @@ pub fn parse(args: &[OsString]) -> Result<Option<Command>, String> {
     let mut cmd = mode.ok_or("nothing to do")?;
     match &mut cmd {
         Command::Help => {}
-        Command::Convert { files: f, notify: n, .. } | Command::Tool { files: f, notify: n, .. } => {
+        Command::Convert { files: f, notify: n, .. } => {
             *f = files;
             *n = notify;
         }
+        Command::Tool { files: f, notify: n, params: p, .. } => {
+            *f = files;
+            *n = notify;
+            *p = std::mem::take(&mut settings);
+        }
         Command::List { files: f } | Command::Wheel { files: f } => *f = files,
+    }
+    if !settings.is_empty() {
+        return Err("tool settings (--start, --percent…) only go with --tool".into());
     }
     let needs_files = !matches!(cmd, Command::Help);
     if needs_files && cmd_files(&cmd).is_empty() {
@@ -127,6 +154,24 @@ pub fn parse(args: &[OsString]) -> Result<Option<Command>, String> {
     }
     Ok(Some(cmd))
 }
+
+/// The flags that carry a tool's settings; see [`apply_settings`].
+const PARAM_FLAGS: &[&str] = &[
+    "--start",
+    "--end",
+    "--parts",
+    "--every",
+    "--at",
+    "--speed",
+    "--fade-in",
+    "--fade-out",
+    "--percent",
+    "--fit",
+    "--aspect",
+    "--rect",
+    "--degrees",
+    "--pages",
+];
 
 fn is_ours(arg: &str) -> bool {
     let flag = arg.split_once('=').map_or(arg, |(f, _)| f);
@@ -147,13 +192,20 @@ fn cmd_files(cmd: &Command) -> &[PathBuf] {
 pub fn tool_name(tool: Tool) -> &'static str {
     match tool {
         Tool::CompressImage | Tool::CompressVideo | Tool::CompressAudio | Tool::CompressPdf => "compress",
-        Tool::ResizeHalf => "resize",
-        Tool::Rotate90 => "rotate",
+        Tool::Resize => "resize",
+        Tool::CropImage => "crop",
+        Tool::Rotate90 | Tool::RotatePdf => "rotate",
         Tool::StripMetadata => "strip-metadata",
         Tool::HalfResVideo => "half-size",
         Tool::MuteVideo => "mute",
+        Tool::Thumbnail => "thumbnail",
         Tool::NormalizeAudio => "normalize",
-        Tool::SplitPdf => "split",
+        Tool::MonoAudio => "mono",
+        Tool::FadeAudio => "fade",
+        Tool::Trim => "trim",
+        Tool::SplitMedia | Tool::SplitPdf => "split",
+        Tool::Speed => "speed",
+        Tool::ExtractPages => "pages",
         Tool::MergePdf => "merge",
         Tool::Extract => "extract",
         Tool::Zip => "zip",
@@ -200,9 +252,79 @@ pub fn resolve(id: &str, files: &[PathBuf]) -> Result<Op, String> {
     })
 }
 
+/// Applies `--start 1:30`-style settings on top of a tool's defaults. A setting that does not
+/// belong to this tool is an error, so a typo never runs silently with the default.
+pub fn apply_settings(base: Params, settings: &[(String, String)]) -> Result<Params, String> {
+    let mut p = base;
+    for (key, raw) in settings {
+        let bad = || format!("--{key}: cannot read {raw:?}");
+        let time = || params::parse_time(raw).ok_or_else(bad);
+        let int = || raw.trim().trim_end_matches('%').parse::<u32>().map_err(|_| bad());
+        let pair = |sep: char| -> Result<(u32, u32), String> {
+            let (a, b) = raw.split_once(sep).ok_or_else(bad)?;
+            Ok((a.trim().parse().map_err(|_| bad())?, b.trim().parse().map_err(|_| bad())?))
+        };
+        p = match (p, key.as_str()) {
+            (Params::Trim { end, .. }, "start") => Params::Trim { start: time()?, end },
+            (Params::Trim { start, .. }, "end") => Params::Trim { start, end: time()? },
+            (Params::Split(_), "parts") => Params::Split(SplitBy::Parts(int()?)),
+            (Params::Split(_), "every") => Params::Split(SplitBy::Every(time()?)),
+            (Params::Thumbnail { .. }, "at") => Params::Thumbnail { at: time()? },
+            (Params::Speed(_), "speed") => {
+                Params::Speed(raw.trim().trim_end_matches(['x', '×']).parse().map_err(|_| bad())?)
+            }
+            (Params::Fade { fade_out, .. }, "fade-in") => Params::Fade { fade_in: time()?, fade_out },
+            (Params::Fade { fade_in, .. }, "fade-out") => Params::Fade { fade_in, fade_out: time()? },
+            (Params::Resize(_), "percent") => Params::Resize(Resize::Percent(int()?)),
+            (Params::Resize(_), "fit") => {
+                let (width, height) = pair('x')?;
+                Params::Resize(Resize::Fit { width, height })
+            }
+            (Params::Crop(_), "aspect") => {
+                let (a, b) = pair(':')?;
+                Params::Crop(Crop::Aspect(a, b))
+            }
+            (Params::Crop(_), "rect") => {
+                let v: Vec<u32> =
+                    raw.split(',').map(|n| n.trim().parse()).collect::<Result<_, _>>().map_err(|_| bad())?;
+                let [x, y, w, h] = v[..] else { return Err(bad()) };
+                Params::Crop(Crop::Rect { x, y, w, h })
+            }
+            (Params::RotatePages(_), "degrees") => Params::RotatePages(int()?),
+            (Params::Pages { .. }, "pages") => match raw.split_once('-') {
+                Some(_) => {
+                    let (first, last) = pair('-')?;
+                    Params::Pages { first, last }
+                }
+                None => Params::Pages { first: int()?, last: int()? },
+            },
+            _ => return Err(format!("--{key} does not apply to this tool")),
+        };
+    }
+    Ok(p)
+}
+
+/// The settings `op` runs with: `None` for an op that asks nothing, else the window's defaults
+/// with `settings` applied, checked the way the dialog checks them.
+pub fn settings_for(op: Op, files: &[PathBuf], settings: &[(String, String)]) -> Result<Option<Params>, String> {
+    let tool = match op {
+        Op::Tool(t) if t.needs_params() => t,
+        _ if settings.is_empty() => return Ok(None),
+        _ => return Err(format!("{} takes no settings", op.label())),
+    };
+    let facts = backend::facts(tool, files);
+    let base = params::defaults(tool, &facts).ok_or_else(|| format!("{} has no defaults", op.label()))?;
+    let p = apply_settings(base, settings)?;
+    params::validate(&p, &facts)?;
+    Ok(Some(p))
+}
+
 /// One line of `--list`.
 pub fn list_line(op: Op, missing: &[String]) -> String {
     let mut line = format!("{}\t{}", option_id(op), op.label());
+    if matches!(op, Op::Tool(t) if t.needs_params()) {
+        line.push_str("\tparams");
+    }
     if !missing.is_empty() {
         line.push_str(&format!("\tunavailable: missing {}", missing.join(", ")));
     }
@@ -227,7 +349,7 @@ fn absolute(files: Vec<PathBuf>) -> Vec<PathBuf> {
 }
 
 fn run(cmd: Command) -> Next {
-    let (op_id, files, notify) = match cmd {
+    let (op_id, files, notify, settings) = match cmd {
         Command::Help => {
             println!("{USAGE}");
             return Next::Exit(0);
@@ -240,8 +362,8 @@ fn run(cmd: Command) -> Next {
             }
             return Next::Exit(0);
         }
-        Command::Convert { target, files, notify } => (format!("convert:{target}"), files, notify),
-        Command::Tool { name, files, notify } => (format!("tool:{name}"), files, notify),
+        Command::Convert { target, files, notify } => (format!("convert:{target}"), files, notify, Vec::new()),
+        Command::Tool { name, files, notify, params } => (format!("tool:{name}"), files, notify, params),
     };
     let files = absolute(files);
     let fail = |msg: String| {
@@ -262,7 +384,11 @@ fn run(cmd: Command) -> Next {
     if !missing.is_empty() {
         return fail(format!("{} needs {}, which is not installed", op.label(), missing.join(", ")));
     }
-    match backend::run(op, &files, config::get().output_dir.as_deref()) {
+    let params = match settings_for(op, &files, &settings) {
+        Ok(p) => p,
+        Err(e) => return fail(e),
+    };
+    match backend::run(op, &files, params.as_ref(), config::get().output_dir.as_deref()) {
         Ok(outputs) => {
             for out in &outputs {
                 println!("{}", out.display());
@@ -324,8 +450,23 @@ mod tests {
         );
         assert_eq!(
             parse(&args(&["--tool=compress", "--notify", "a.pdf"])),
-            Ok(Some(Command::Tool { name: "compress".into(), files: vec!["a.pdf".into()], notify: true }))
+            Ok(Some(Command::Tool {
+                name: "compress".into(),
+                files: vec!["a.pdf".into()],
+                notify: true,
+                params: Vec::new()
+            }))
         );
+        assert_eq!(
+            parse(&args(&["--tool", "trim", "--start", "0:02", "--end=0:10", "a.mp4"])),
+            Ok(Some(Command::Tool {
+                name: "trim".into(),
+                files: vec!["a.mp4".into()],
+                notify: false,
+                params: vec![("start".into(), "0:02".into()), ("end".into(), "0:10".into())]
+            }))
+        );
+        assert!(parse(&args(&["--convert", "png", "--start", "1", "a.jpg"])).is_err(), "settings without --tool");
         assert!(parse(&args(&["--convert"])).is_err());
         assert!(parse(&args(&["--convert", "--list", "a"])).is_err());
     }
@@ -369,6 +510,12 @@ mod tests {
         assert_eq!(resolve("tool:zip", &[p("a.png"), p("b.mp3")]), Ok(Op::Tool(Tool::Zip)));
         assert_eq!(resolve("tool:extract", &[p("a.tar.gz")]), Ok(Op::Tool(Tool::Extract)));
         assert_eq!(resolve("tool:half-size", &[p("a.mkv")]), Ok(Op::Tool(Tool::HalfResVideo)));
+        // One name, the right tool per kind.
+        assert_eq!(resolve("tool:rotate", &[p("a.png")]), Ok(Op::Tool(Tool::Rotate90)));
+        assert_eq!(resolve("tool:rotate", &[p("a.pdf")]), Ok(Op::Tool(Tool::RotatePdf)));
+        assert_eq!(resolve("tool:split", &[p("a.pdf")]), Ok(Op::Tool(Tool::SplitPdf)));
+        assert_eq!(resolve("tool:split", &[p("a.mp3")]), Ok(Op::Tool(Tool::SplitMedia)));
+        assert_eq!(resolve("tool:trim", &[p("a.wav")]), Ok(Op::Tool(Tool::Trim)));
     }
 
     #[test]
@@ -392,11 +539,64 @@ mod tests {
     }
 
     #[test]
+    fn settings_override_defaults() {
+        let s = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        };
+        let trim = Params::Trim { start: 0.0, end: 60.0 };
+        assert_eq!(
+            apply_settings(trim, &s(&[("start", "0:02"), ("end", "10.5")])),
+            Ok(Params::Trim { start: 2.0, end: 10.5 })
+        );
+        assert_eq!(
+            apply_settings(Params::Resize(Resize::Percent(50)), &s(&[("fit", "800x600")])),
+            Ok(Params::Resize(Resize::Fit { width: 800, height: 600 }))
+        );
+        assert_eq!(
+            apply_settings(Params::Resize(Resize::Percent(50)), &s(&[("percent", "25%")])),
+            Ok(Params::Resize(Resize::Percent(25)))
+        );
+        assert_eq!(
+            apply_settings(Params::Crop(Crop::Aspect(1, 1)), &s(&[("rect", "1,2,30,40")])),
+            Ok(Params::Crop(Crop::Rect { x: 1, y: 2, w: 30, h: 40 }))
+        );
+        assert_eq!(
+            apply_settings(Params::Pages { first: 1, last: 9 }, &s(&[("pages", "2-4")])),
+            Ok(Params::Pages { first: 2, last: 4 })
+        );
+        assert_eq!(apply_settings(Params::Speed(2.0), &s(&[("speed", "1.5x")])), Ok(Params::Speed(1.5)));
+        assert!(apply_settings(trim, &s(&[("percent", "50")])).is_err(), "wrong tool");
+        assert!(apply_settings(trim, &s(&[("start", "soon")])).is_err(), "unreadable");
+    }
+
+    #[test]
+    fn param_tools_always_get_params() {
+        let files = [p("a.png")];
+        // Defaults stand in for the dialog when no flag is given.
+        assert_eq!(settings_for(Op::Tool(Tool::Resize), &files, &[]), Ok(Some(Params::Resize(Resize::Percent(50)))));
+        assert_eq!(settings_for(Op::Tool(Tool::CompressImage), &files, &[]), Ok(None));
+        assert!(settings_for(Op::Convert("jpg"), &files, &[("start".into(), "1".into())]).is_err());
+        // Validation runs: 100% is not a resize.
+        assert!(settings_for(Op::Tool(Tool::Resize), &files, &[("percent".into(), "100".into())]).is_err());
+        for op in offered(&[p("a.mp4")]).into_iter().chain(offered(&[p("a.pdf")])).chain(offered(&files)) {
+            if let Op::Tool(t) = op
+                && t.needs_params()
+            {
+                // Trim's default end is the probed length, unknown for a missing file.
+                if t != Tool::Trim {
+                    assert!(matches!(settings_for(op, &files, &[]), Ok(Some(_))), "{t:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn list_lines() {
         assert_eq!(list_line(Op::Convert("png"), &[]), "convert:png\tPNG");
         assert_eq!(
             list_line(Op::Tool(Tool::CompressPdf), &["gs".into()]),
             "tool:compress\tCompress\tunavailable: missing gs"
         );
+        assert_eq!(list_line(Op::Tool(Tool::Trim), &[]), "tool:trim\tTrim…\tparams");
     }
 }
