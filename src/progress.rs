@@ -121,6 +121,33 @@ impl Cancel {
     }
 }
 
+/// Set by the signal handler of [`cancel_on_interrupt`].
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_interrupt(_: libc::c_int) {
+    INTERRUPTED.store(true, Ordering::SeqCst);
+}
+
+/// Cancels `cancel` when the process gets SIGINT, SIGTERM or SIGHUP. Children run in their own
+/// process group, so a terminal's Ctrl-C no longer reaches them directly; this passes it on, and
+/// the run cleans up and returns [`Cancelled`]. For the command line, where nothing else
+/// handles these signals.
+pub fn cancel_on_interrupt(cancel: &Cancel) {
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        // SAFETY: the handler only stores to an atomic, which is async-signal-safe.
+        unsafe {
+            libc::signal(signal, on_interrupt as extern "C" fn(libc::c_int) as libc::sighandler_t);
+        }
+    }
+    let cancel = cancel.clone();
+    std::thread::spawn(move || {
+        while !INTERRUPTED.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        cancel.cancel();
+    });
+}
+
 /// Sends `signal` to every process in group `group` (the child and anything it spawned, such as
 /// LibreOffice's `soffice.bin`). A group that is already gone is not an error.
 pub(crate) fn signal_group(group: i32, signal: libc::c_int) {

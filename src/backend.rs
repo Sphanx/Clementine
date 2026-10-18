@@ -791,7 +791,7 @@ fn is_work(step: &Step) -> bool {
 /// A job that fails leaves nothing behind; earlier, successful jobs are kept.
 /// `params` are the settings of a tool that asks for them. Results go to `dest` (created if
 /// needed) or, when `None`, next to each input.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn run(op: Op, files: &[PathBuf], params: Option<&Params>, dest: Option<&Path>) -> Result<Vec<PathBuf>> {
     run_with(op, files, params, dest, &Cancel::new(), &|_| {})
 }
