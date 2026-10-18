@@ -354,6 +354,60 @@ fn redraw(state: &App) {
     wheel::sync(&state.area, &mut state.wheel.borrow_mut());
 }
 
+/// Every action a drop may arrive with. We only ever read the files, but on X11 the drag source
+/// turns the held modifier into the action and offers only that one: Shift = move, Ctrl = copy,
+/// Shift+Ctrl = link. Accepting copy alone made the window refuse any drag with Shift held.
+const DROP_ACTIONS: gdk::DragAction = gdk::DragAction::COPY.union(gdk::DragAction::MOVE).union(gdk::DragAction::LINK);
+
+/// The action to answer a drag with: one the source offers, copy when it can.
+fn drop_action(offered: gdk::DragAction) -> gdk::DragAction {
+    [gdk::DragAction::COPY, gdk::DragAction::MOVE, gdk::DragAction::LINK]
+        .into_iter()
+        .find(|a| offered.contains(*a))
+        .unwrap_or(gdk::DragAction::COPY)
+}
+
+fn debug_dnd() -> bool {
+    std::env::var_os("SUSEN_DEBUG_DND").is_some()
+}
+
+/// The modifier keys held right now, as far as this window can know.
+///
+/// Drag events carry no modifier state (`current_event_state()` is empty on X11), so the
+/// keyboard device is asked as well. X11 reports its state for the whole display, so it is right
+/// even while another app's drag holds the keyboard; Wayland only tells the focused window, so
+/// there it is trusted only while this window is active.
+fn held_modifiers(state: &App, target: &gtk::DropTarget) -> gdk::ModifierType {
+    let mut mods = target.current_event_state();
+    if let Some(drop) = target.current_drop() {
+        mods |= drop.device().modifier_state();
+    }
+    let display = WidgetExt::display(&state.window);
+    if display.type_().name() == "GdkX11Display" || state.window.is_active() {
+        mods |= display
+            .default_seat()
+            .and_then(|s| s.keyboard())
+            .map_or(gdk::ModifierType::empty(), |k| k.modifier_state());
+    }
+    mods
+}
+
+/// A wheel's modifier went down mid-drag: open that wheel at the pointer, or switch to it.
+/// It stays open after the key is released, until the drop or the drag leaves.
+fn modifier_during_drag(state: &App, mode: Mode) {
+    if debug_dnd() {
+        eprintln!("dnd: modifier {mode:?}");
+    }
+    if !state.wheel.borrow().open {
+        open_wheel(state, mode, state.pointer.get(), state.drag_files.borrow().clone(), false);
+        return;
+    }
+    if state.wheel.borrow().mode != Some(mode) {
+        state.wheel.borrow_mut().set_mode(mode);
+        redraw(state);
+    }
+}
+
 /// Called on every drag event over the window: opens, switches and aims the wheel.
 fn track_drag(state: &App, target: &gtk::DropTarget, x: f64, y: f64) {
     state.dragging.set(true);
@@ -363,7 +417,12 @@ fn track_drag(state: &App, target: &gtk::DropTarget, x: f64, y: f64) {
         *state.drag_files.borrow_mut() = files;
     }
     let files = state.drag_files.borrow().clone();
-    let keyed = mode_for(target.current_event_state());
+    let mods = held_modifiers(state, target);
+    let keyed = mode_for(mods);
+    if debug_dnd() {
+        let offered = target.current_drop().map(|d| d.actions());
+        eprintln!("dnd: motion offered={offered:?} mods={mods:?} wheel={:?}", state.wheel.borrow().mode);
+    }
     let chip = chip_at(state, x, y);
     if !state.wheel.borrow().open {
         if let Some(mode) = chip {
@@ -394,7 +453,7 @@ fn end_drag(state: &App) {
 }
 
 fn wire_drop(state: &Rc<App>) {
-    let target = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+    let target = gtk::DropTarget::new(gdk::FileList::static_type(), DROP_ACTIONS);
     target.set_preload(true);
 
     let weak = Rc::downgrade(state);
@@ -402,14 +461,14 @@ fn wire_drop(state: &Rc<App>) {
         if let Some(state) = weak.upgrade() {
             track_drag(&state, t, x, y);
         }
-        gdk::DragAction::COPY
+        drop_action(t.current_drop().map_or(gdk::DragAction::COPY, |d| d.actions()))
     });
     let weak = Rc::downgrade(state);
     target.connect_motion(move |t, x, y| {
         if let Some(state) = weak.upgrade() {
             track_drag(&state, t, x, y);
         }
-        gdk::DragAction::COPY
+        drop_action(t.current_drop().map_or(gdk::DragAction::COPY, |d| d.actions()))
     });
     let weak = Rc::downgrade(state);
     target.connect_leave(move |_| {
@@ -429,6 +488,9 @@ fn wire_drop(state: &Rc<App>) {
             })
         };
         end_drag(&state);
+        if debug_dnd() {
+            eprintln!("dnd: drop chosen={chosen:?}");
+        }
         match chosen {
             // Dropped on a slice.
             Some(Some(op)) => execute(&state, op, files),
@@ -440,6 +502,22 @@ fn wire_drop(state: &Rc<App>) {
         true
     });
     state.overlay.add_controller(target);
+
+    // A tap with the pointer still: no drag event follows, and during a drag (ours or, on X11,
+    // another app's) the drag holds the keyboard grab, so no key event reaches the window either.
+    // The keyboard device still announces its new modifier state.
+    let keyboard = WidgetExt::display(&state.window).default_seat().and_then(|s| s.keyboard());
+    if let Some(keyboard) = keyboard {
+        let weak = Rc::downgrade(state);
+        keyboard.connect_modifier_state_notify(move |kb| {
+            let Some(state) = weak.upgrade() else { return };
+            if state.dragging.get()
+                && let Some(mode) = mode_for(kb.modifier_state())
+            {
+                modifier_during_drag(&state, mode);
+            }
+        });
+    }
 }
 
 fn wire_keys(state: &Rc<App>) {
@@ -456,12 +534,7 @@ fn wire_keys(state: &Rc<App>) {
         if state.dragging.get()
             && let Some(mode) = config::get().mode_for_key(key)
         {
-            if open {
-                state.wheel.borrow_mut().set_mode(mode);
-                redraw(&state);
-            } else {
-                open_wheel(&state, mode, state.pointer.get(), state.drag_files.borrow().clone(), false);
-            }
+            modifier_during_drag(&state, mode);
             return glib::Propagation::Stop;
         }
         if !open {
