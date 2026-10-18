@@ -231,7 +231,13 @@ fn im_unsafe_name(path: &Path) -> bool {
 /// scratch and then moved onto `out`, so neither name is ever expanded. A multi-frame result
 /// stays in one file (GIF, TIFF and WebP hold frames); any other spread is caught by the move.
 fn magick_steps(steps: &mut Vec<Step>, input: &Path, frame: &str, args: &[OsString], out: &Path, scratch: &Path) {
-    let src = if im_unsafe_name(input) {
+    // SVG never reaches ImageMagick: depending on the build it renders SVG through its MVG coder,
+    // which policy.xml forbids. rsvg-convert draws it to a PNG in scratch instead.
+    let src = if extension(input) == "svg" {
+        let png = scratch_file(scratch, "png");
+        steps.push(Step::Run(Cmd::new("rsvg-convert").arg("-o").arg(&png).arg(input)));
+        png
+    } else if im_unsafe_name(input) {
         let link = scratch_file(scratch, &extension(input));
         steps.push(Step::Link { from: input.to_path_buf(), to: link.clone() });
         link
@@ -1161,10 +1167,6 @@ pub fn missing_programs(op: Op, files: &[PathBuf]) -> Vec<String> {
     if matches!(op, Op::Tool(Tool::SplitMedia | Tool::FadeAudio)) {
         programs.push("ffprobe".into());
     }
-    // ImageMagick reads SVG through librsvg's rsvg-convert.
-    if programs.iter().any(|p| p == magick()) && files.iter().any(|f| extension(f) == "svg") {
-        programs.push("rsvg-convert".into());
-    }
     // ImageMagick writes HEIC and AVIF through libheif, whose encoders are separate packages.
     let mut plugins = Vec::new();
     if let Op::Convert(target) = op
@@ -1524,7 +1526,12 @@ pub fn sample_rate(path: &Path) -> Option<u32> {
 /// An image's width and height as the tools see it: first frame, upright.
 pub fn image_size(path: &Path) -> Option<(u32, u32)> {
     // A name ImageMagick would expand is read through a safely named link.
-    let alias = if im_unsafe_name(path) {
+    let alias = if extension(path) == "svg" {
+        let dir = tempfile::Builder::new().prefix("susen-size-").tempdir().ok()?;
+        let png = dir.path().join("i.png");
+        capture("rsvg-convert", &[OsStr::new("-o"), png.as_os_str(), std::path::absolute(path).ok()?.as_os_str()])?;
+        Some((dir, png))
+    } else if im_unsafe_name(path) {
         let dir = tempfile::Builder::new().prefix("susen-size-").tempdir().ok()?;
         let link = dir.path().join(format!("i.{}", extension(path)));
         std::os::unix::fs::symlink(std::path::absolute(path).ok()?, &link).ok()?;

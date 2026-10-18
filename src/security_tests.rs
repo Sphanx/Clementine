@@ -328,3 +328,19 @@ fn svg_needs_rsvg_convert() {
     assert_eq!(missing.contains(&"rsvg-convert".to_string()), !has_program("rsvg-convert"));
     assert!(!missing_programs(Op::Tool(Tool::Zip), &svg).contains(&"rsvg-convert".to_string()));
 }
+
+#[test]
+fn svg_is_drawn_by_rsvg_not_imagemagick() {
+    let svg = vec![PathBuf::from("/x/drawing.svg")];
+    let jobs = plan(Op::Convert("png"), &svg, None, Path::new("/scratch")).unwrap();
+    let runs: Vec<&Cmd> = jobs[0]
+        .steps
+        .iter()
+        .filter_map(|s| match s {
+            Step::Run(c) => Some(c),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(runs[0].program, "rsvg-convert");
+    assert!(runs[1..].iter().all(|c| !c.args.iter().any(|a| a.to_string_lossy().contains("drawing.svg"))));
+}
