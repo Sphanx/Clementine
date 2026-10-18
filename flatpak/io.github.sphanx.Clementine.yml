@@ -1,0 +1,164 @@
+# Flatpak manifest for Clementine.
+#
+# Build (from the repo root):
+#   flatpak install --user flathub org.gnome.Platform//51 org.gnome.Sdk//51 \
+#       org.freedesktop.Sdk.Extension.rust-stable//26.08
+#   flatpak-builder --user --install --force-clean build-dir flatpak/io.github.sphanx.Clementine.yml
+#
+# Regenerate cargo-sources.json whenever Cargo.lock changes:
+#   pip install flatpak-cargo-generator
+#   flatpak-cargo-generator Cargo.lock -o flatpak/cargo-sources.json
+#
+# Bundled converters (built as modules below): ffmpeg (with lame), pandoc, zip, unzip, poppler-utils.
+# NOT bundled, so the Flatpak build does not contain them and the matching slices stay greyed out:
+#   - ImageMagick: no pinned source tarball yet (the imagemagick.org listing was not parseable)
+#   - LibreOffice (soffice): too large to bundle; use the host or the Flathub LibreOffice app
+#   - unrar, p7zip, ghostscript: licensing and size; not bundled
+# The sandbox does NOT call host tools through flatpak-spawn.
+#
+# Status: this manifest has been checked for YAML validity and its source URLs and hashes were
+# fetched. It has NOT been run through flatpak-builder end to end; treat a first build as the test.
+
+id: io.github.sphanx.Clementine
+runtime: org.gnome.Platform
+runtime-version: '51'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: clementine
+finish-args:
+  # Files are read and written next to their inputs, so the whole home directory is needed.
+  - --filesystem=home
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  - --device=dri
+  - --talk-name=org.freedesktop.FileManager1
+  - --env=PATH=/app/bin:/usr/bin
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/clementine/cargo
+
+modules:
+  # ---- Bundled converters --------------------------------------------------
+
+  - name: lame
+    buildsystem: autotools
+    config-opts:
+      - --disable-static
+      - --enable-nasm=no
+    sources:
+      - type: archive
+        url: https://downloads.sourceforge.net/project/lame/lame/3.100/lame-3.100.tar.gz
+        sha256: ddfe36cab873794038ae2c1210557ad34857a4b6bdc515785d1da9e175b1da1e
+
+  - name: ffmpeg
+    buildsystem: autotools
+    config-opts:
+      - --prefix=/app
+      - --enable-gpl
+      - --enable-shared
+      - --disable-static
+      - --disable-doc
+      - --disable-debug
+      - --disable-ffplay
+      - --disable-ffprobe
+      - --enable-libmp3lame
+    cleanup:
+      - /include
+      - /lib/pkgconfig
+      - /share/ffmpeg/examples
+    sources:
+      - type: archive
+        url: https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz
+        sha256: 8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e
+
+  - name: pandoc
+    buildsystem: simple
+    only-arches:
+      - x86_64
+    build-commands:
+      - install -Dm755 bin/pandoc /app/bin/pandoc
+    sources:
+      - type: archive
+        url: https://github.com/jgm/pandoc/releases/download/3.9/pandoc-3.9-linux-amd64.tar.gz
+        sha256: 872a10c7ec29d5278831d855b11bd4ade0df4d5ec9a089a3197bc63a37eb4003
+        strip-components: 1
+        only-arches:
+          - x86_64
+
+  - name: zip
+    buildsystem: simple
+    build-commands:
+      - make -f unix/Makefile generic
+      - make -f unix/Makefile prefix=/app install
+    sources:
+      - type: archive
+        url: https://downloads.sourceforge.net/infozip/zip30.tar.gz
+        sha256: f0e8bb1f9b7eb0b01285495a2699df3a4b766784c1765a8f1aeedf63c0806369
+
+  - name: unzip
+    buildsystem: simple
+    build-commands:
+      - make -f unix/Makefile generic
+      - make -f unix/Makefile prefix=/app install
+    sources:
+      - type: archive
+        url: https://downloads.sourceforge.net/infozip/unzip60.tar.gz
+        sha256: 036d96991646d0449ed0aa952e4fbe21b476ce994abc276e49d30e686708bd37
+
+  - name: poppler-utils
+    buildsystem: meson
+    config-opts:
+      - -Dqt5=disabled
+      - -Dqt6=disabled
+      - -Dcpp=disabled
+      - -Dglib=disabled
+      - -Dlibcurl=disabled
+      - -Dnss3=disabled
+      - -Dgpgme=disabled
+      - -Dtests=disabled
+      - -Dintrospection=disabled
+      - -Dutils=true
+    cleanup:
+      - /include
+      - /lib/pkgconfig
+    sources:
+      - type: archive
+        url: https://poppler.freedesktop.org/poppler-26.10.0.tar.xz
+        sha256: 6792cb7c69205007ad87d2e936cecc5b3a31fac29ab54ffc3175fdb6b2a6ce35
+
+  # ---- Clementine -------------------------------------------------------------
+
+  - name: clementine
+    buildsystem: simple
+    build-options:
+      env:
+        CARGO_HOME: /run/build/clementine/cargo
+    build-commands:
+      - cargo --offline fetch --manifest-path Cargo.toml --verbose
+      - cargo --offline build --release --verbose
+      - install -Dm755 target/release/clementine -t /app/bin/
+      - install -Dm644 data/io.github.sphanx.Clementine.desktop -t /app/share/applications/
+      - install -Dm644 data/io.github.sphanx.Clementine.metainfo.xml -t /app/share/metainfo/
+      - install -Dm644 data/icons/hicolor/scalable/apps/io.github.sphanx.Clementine.svg -t /app/share/icons/hicolor/scalable/apps/
+      - install -Dm644 data/icons/hicolor/symbolic/apps/io.github.sphanx.Clementine-symbolic.svg -t /app/share/icons/hicolor/symbolic/apps/
+    sources:
+      - type: dir
+        path: ..
+        skip:
+          - target
+          - .git
+          - flatpak/.flatpak-builder
+      - cargo-sources.json
+      - type: inline
+        dest: .cargo
+        dest-filename: config.toml
+        contents: |
+          [source.crates-io]
+          replace-with = "vendored-sources"
+
+          [source.vendored-sources]
+          directory = "cargo/vendor"
