@@ -312,5 +312,5 @@ fn a_dangling_link_is_never_an_output_name() {
     let (root, _secret, input) = sandbox();
     std::os::unix::fs::symlink(root.path().join("home/planted"), input.join("a.jpg")).unwrap();
     let mut names = Names::default();
-    assert_eq!(names.claim(&input, "a", "jpg"), input.join("a (2).jpg"));
+    assert_eq!(names.claim(&input, "a", "jpg").unwrap(), input.join("a (2).jpg"));
 }

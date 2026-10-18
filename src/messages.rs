@@ -28,6 +28,11 @@ pub fn headline(raw: &str) -> String {
         "file is encrypted",
         "encrypted pdf",
     ]) {
+        if low.contains("password-protected archive") {
+            return "This archive is password-protected. Extract it with its password in your archive \
+                    manager, then try again."
+                .into();
+        }
         return "This PDF is password-protected. Remove the password in a PDF viewer, then try again.".into();
     }
     if has(&["unknown encoder", "encoder not found", "unknown decoder", "decoder not found", "unsupported codec"])
@@ -102,6 +107,14 @@ mod tests {
         ] {
             assert!(headline(raw).contains("password-protected"), "{raw}");
         }
+    }
+
+    #[test]
+    fn password_detected_up_front() {
+        let pdf = "locked.pdf is a password-protected PDF; Susen cannot open it without the password";
+        assert!(headline(pdf).starts_with("This PDF is password-protected"), "{}", headline(pdf));
+        let zip = "locked.zip is a password-protected archive; Susen cannot open it without the password";
+        assert!(headline(zip).starts_with("This archive is password-protected"), "{}", headline(zip));
     }
 
     #[test]

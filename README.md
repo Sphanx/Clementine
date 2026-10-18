@@ -48,7 +48,7 @@ colours (light, dark and high contrast), and a muted purple selection; every lab
 4.5:1 contrast ratio or better. Long labels wrap, shrink, then ellipsize to stay inside their slice.
 
 When a conversion fails, the status line says why in plain words (missing HEIC/AVIF support,
-unsupported codec, password-protected PDF, damaged file); hover **Failed** for the program's own message.
+unsupported codec, password-protected PDF or archive, damaged file); hover **Failed** for the program's own message.
 
 **Settings** (the gear in the header bar) change which modifier opens which wheel (Shift, Ctrl, Alt or
 Super, each on one wheel only), whether results go next to the original or into one folder, and whether
@@ -202,7 +202,9 @@ sudo apt install ./susen_0.1.0-1_amd64.deb
 ```
 
 apt pulls in GTK 4 and recommends the converters (ffmpeg, ImageMagick, pandoc, poppler-utils, zip,
-unzip). LibreOffice, unrar, p7zip, ghostscript and qpdf are suggested, not installed.
+unzip) and the libheif plugins ImageMagick needs for HEIC and AVIF (`libheif-plugin-x265` and
+`libheif-plugin-aomenc` to write them, `libheif-plugin-libde265` to read HEIC). Without a writer
+plugin the HEIC or AVIF slice is grey, and hovering it names the package. LibreOffice, unrar, p7zip, ghostscript and qpdf are suggested, not installed.
 
 **Flatpak.** The manifest is `flatpak/io.github.sphanx.Susen.yml`; it is not on Flathub yet.
 

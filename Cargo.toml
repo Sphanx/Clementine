@@ -27,7 +27,7 @@ hold a modifier key, and drop it on a format on the conversion wheel. Conversion
 through ffmpeg, ImageMagick, pandoc, LibreOffice, poppler and the archive tools already \
 on your computer."""
 depends = "$auto, libgtk-4-1 (>= 4.14)"
-recommends = "ffmpeg, imagemagick, pandoc, poppler-utils, zip, unzip"
+recommends = "ffmpeg, imagemagick, pandoc, poppler-utils, zip, unzip, libheif-plugin-x265, libheif-plugin-aomenc, libheif-plugin-libde265"
 suggests = "libreoffice-core, unrar, p7zip-full, ghostscript, qpdf, python3-nautilus, libnotify-bin"
 assets = [
     ["target/release/susen", "usr/bin/", "755"],

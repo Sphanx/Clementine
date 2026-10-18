@@ -298,8 +298,7 @@ fn looks_valid(out: &Path) -> Result<(), String> {
         return Err(format!("{} is empty", out.display()));
     }
     let ok = match kind_of(out) {
-        // `image_size` hands the name to ImageMagick, which reads `%d` in it as a pattern
-        // (see `bug_percent_names_are_taken_literally`); the bytes on stdin are checked instead.
+        // `image_size` reads a name with `%` or glob characters through a safely named link.
         Kind::Image => image_size(out).is_some() || image_on_stdin(out),
         Kind::Audio | Kind::Video => media_duration(out).is_some(),
         Kind::Pdf => pdf_page_count(out).is_some_and(|n| n > 0),
@@ -406,7 +405,7 @@ fn run_any(op: Op, files: &[PathBuf], dir: &Path, secs: u64) -> Result<Outcome, 
 
 /// Other Susen processes (a second checkout, the GUI, the file manager menus) share the
 /// LibreOffice profile in `~/.cache/susen`, and LibreOffice fails silently when two
-/// processes use one profile (see `bug_two_processes_convert_with_libreoffice_at_once`). The
+/// processes use one profile (fixed with a `flock`, see `qa_two_processes_convert_with_libreoffice_at_once`). The
 /// tests here get a cache folder of their own.
 fn isolate_libreoffice() {
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -652,15 +651,6 @@ fn more_samples(dir: &Path) -> Vec<PathBuf> {
     names.iter().map(|n| dir.join(n)).collect()
 }
 
-/// Ops on [`more_samples`] that fail for a known, open bug, and the `bug_` test that reproduces it.
-fn known_bug(file: &Path, op: Op) -> Option<&'static str> {
-    let name = file.file_name()?.to_str()?;
-    match (name, op) {
-        ("i_multi.tiff", Op::Tool(Tool::Resize)) => Some("bug_resize_on_animations_and_multi_page_images"),
-        _ => None,
-    }
-}
-
 /// Every offered op on every extra sample, outputs checked by reading them back.
 #[test]
 #[ignore = "slow: runs the converters"]
@@ -680,10 +670,6 @@ fn qa_every_op_on_more_formats() {
                         let name = format!("{} → {}", file.file_name().unwrap().to_string_lossy(), op.label());
                         if let Err(why) = runnable(op, &files) {
                             println!("skip {name}: {why}");
-                            continue;
-                        }
-                        if let Some(bug) = known_bug(file, op) {
-                            println!("skip {name}: known bug, see {bug}");
                             continue;
                         }
                         ran.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -877,8 +863,8 @@ fn qa_upper_case_extensions_work() {
 }
 
 #[test]
-#[ignore = "BUG: ImageMagick, pdfseparate and ffmpeg's image writer expand % patterns in output names"]
-fn bug_percent_names_are_taken_literally() {
+#[ignore = "slow: runs the converters"]
+fn qa_percent_names_are_taken_literally() {
     let failures = hostile_failures(PERCENT, false);
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
@@ -944,8 +930,8 @@ fn qa_gz_and_tar_gz_extract_differently() {
 
 /// Relative paths (a command line, or a future CLI) must work like absolute ones.
 #[test]
-#[ignore = "BUG: relative inputs break ops that run with a working folder (Zip, archive conversion)"]
-fn bug_relative_paths_work() {
+#[ignore = "slow: runs the converters"]
+fn qa_relative_paths_work() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     // Deep enough that `..`s meant for the test's working folder cannot land back in place.
@@ -1126,13 +1112,12 @@ fn qa_wrong_extension_with_real_content_fails_cleanly() {
     }
 }
 
-/// `*` and `?` in an image's name: with the decoder pinned (`png:/a/b*.png`), ImageMagick no longer
-/// checks for the literal file first and globs, so siblings matching the pattern are read too.
-/// The result is a multi-frame write to `name-0.png`, `name-1.png`…, reported as `name.png`,
-/// which does not exist.
+/// Regression: `*` and `?` in an image's name. With the decoder pinned (`png:/a/b*.png`),
+/// ImageMagick globs, so siblings matching the pattern were read too and written as `name-0.png`,
+/// `name-1.png`…, reported as `name.png`. Such inputs are now read through a safely named link.
 #[test]
-#[ignore = "BUG: image names with * or ? read every sibling the pattern matches"]
-fn bug_glob_characters_in_image_names() {
+#[ignore = "slow: runs the converters"]
+fn qa_glob_characters_in_image_names() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     sh(d, im(), &["-size", "64x48", "xc:red", "star*?.png"]);
@@ -1170,8 +1155,8 @@ fn encrypted_samples(dir: &Path) -> Vec<PathBuf> {
 /// Password-protected inputs fail with an error and never wait for a password. Programs are
 /// started without a terminal (`setsid`), like the GUI is.
 #[test]
-#[ignore = "BUG: password-protected archives and PDFs hang or fail without saying why"]
-fn bug_password_protected_inputs_fail_cleanly() {
+#[ignore = "slow: runs the converters"]
+fn qa_password_protected_inputs_fail_cleanly() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     let mut bad = Vec::new();
@@ -1217,8 +1202,8 @@ fn race(op: Op, file: &Path, n: usize) -> Vec<PathBuf> {
 
 /// Eight conversions of one file to one format at the same time must give eight files.
 #[test]
-#[ignore = "BUG: Names::claim checks the disk at plan time, so concurrent runs claim the same output"]
-fn bug_concurrent_runs_never_share_an_output() {
+#[ignore = "slow: runs the converters"]
+fn qa_concurrent_runs_never_share_an_output() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     sh(d, im(), &["-size", "400x300", "plasma:", "photo.png"]);
@@ -1228,7 +1213,7 @@ fn bug_concurrent_runs_never_share_an_output() {
     assert_eq!((distinct.len(), on_disk), (8, 8), "outputs reported: {outs:?}");
 }
 
-/// Two LibreOffice conversions at once (different files) both succeed: `LO_LOCK` queues them.
+/// Two LibreOffice conversions at once (different files) both succeed: the LibreOffice lock queues them.
 #[test]
 #[ignore = "slow: runs the converters"]
 fn qa_two_libreoffice_jobs_at_once() {
@@ -1319,12 +1304,12 @@ fn expect_all_work(cases: Vec<(PathBuf, Op)>, dir: &Path) {
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
 
-/// Resize… at its default 50% on an animated GIF or a multi-page TIFF: ImageMagick reads the `%`
-/// in `name (50%).gif` as a frame pattern and writes `name (50%)-0.gif`, and the run reports
-/// success with an output that does not exist.
+/// Regression: Resize… at its default 50% on an animated GIF or a multi-page TIFF. ImageMagick
+/// read the `%` in `name (50%).gif` as a frame pattern and wrote `name (50%)-0.gif`. It now writes
+/// a safe scratch name that is moved into place, and the animation stays one animated file.
 #[test]
-#[ignore = "BUG: Resize 50% on a GIF animation or multi-page TIFF reports a file that does not exist"]
-fn bug_resize_on_animations_and_multi_page_images() {
+#[ignore = "slow: runs the converters"]
+fn qa_resize_on_animations_and_multi_page_images() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     sh(d, im(), &["-size", "64x48", "xc:red", "xc:blue", "-set", "delay", "20", "anim.gif"]);
@@ -1333,6 +1318,11 @@ fn bug_resize_on_animations_and_multi_page_images() {
         vec![(d.join("anim.gif"), Op::Tool(Tool::Resize)), (d.join("pages.tiff"), Op::Tool(Tool::Resize))],
         d,
     );
+    for out in ["anim (50%).gif", "pages (50%).tiff"] {
+        let file = std::fs::File::open(d.join(out)).unwrap();
+        let frames = Command::new(im()).args(["-", "-format", "%w\\n", "info:"]).stdin(file).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&frames.stdout).lines().collect::<Vec<_>>(), ["32", "32"], "{out}");
+    }
 }
 
 /// Normalize: `loudnorm` outputs 192 kHz, which the WMA encoder refused; the source's rate is
@@ -1714,12 +1704,12 @@ fn qa_cli_fails_cleanly() {
 }
 
 /// Two Susen processes (two file-manager menu clicks, or the CLI next to the window) convert
-/// with LibreOffice at once. `LO_LOCK` only queues calls inside one process; across processes
-/// both share `~/.cache/susen/libreoffice`, and the second LibreOffice hands its job to the
-/// first and exits 1 without a message.
+/// with LibreOffice at once. Both share `~/.cache/susen/libreoffice`, and without a lock across
+/// processes the second LibreOffice hands its job to the first and exits 1 without a message;
+/// the `flock` on `libreoffice.lock` queues them.
 #[test]
-#[ignore = "BUG: two processes converting with LibreOffice at once fail silently (shared profile)"]
-fn bug_two_processes_convert_with_libreoffice_at_once() {
+#[ignore = "slow: runs the converters"]
+fn qa_two_processes_convert_with_libreoffice_at_once() {
     if !has_program("soffice") {
         return;
     }
