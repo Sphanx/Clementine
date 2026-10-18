@@ -4,8 +4,8 @@
 //! is ffmpeg, ImageMagick, pandoc, LibreOffice and poppler, all local. An op whose
 //! programs are missing is still listed, but greyed out (see [`missing_programs`]).
 //!
-//! Outputs land next to the input under a name that is never taken, so an input
-//! is never overwritten.
+//! Outputs land next to the input, or in the folder chosen in Settings, under a name that is
+//! never taken, so an input is never overwritten.
 
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
@@ -63,11 +63,14 @@ pub struct Job {
 #[derive(Default)]
 pub struct Names {
     taken: HashSet<PathBuf>,
+    /// When set, every claim lands here instead of in the folder asked for.
+    dest: Option<PathBuf>,
 }
 
 impl Names {
     /// `dir/stem.ext`, or `dir/stem (2).ext`, `dir/stem (3).ext`… An empty `ext` names a folder.
     pub fn claim(&mut self, dir: &Path, stem: &str, ext: &str) -> PathBuf {
+        let dir = self.dest.as_deref().unwrap_or(dir);
         for n in 1.. {
             let base = if n == 1 { stem.to_string() } else { format!("{stem} ({n})") };
             let name = if ext.is_empty() { base } else { format!("{base}.{ext}") };
@@ -571,8 +574,19 @@ fn tool_job(input: &Path, tool: Tool, setup: &Setup, names: &mut Names) -> Resul
 /// tools that need a file's length probe it with ffprobe. Without them, a tool that asks is
 /// planned with stand-in settings, only to learn which programs it calls.
 pub fn plan(op: Op, files: &[PathBuf], params: Option<&Params>, scratch: &Path) -> Result<Vec<Job>> {
+    plan_in(op, files, params, scratch, None)
+}
+
+/// Like [`plan`], with every output placed in `dest` instead of next to its input.
+pub fn plan_in(
+    op: Op,
+    files: &[PathBuf],
+    params: Option<&Params>,
+    scratch: &Path,
+    dest: Option<&Path>,
+) -> Result<Vec<Job>> {
     // Inputs are claimed up front, so no output can ever be named after one.
-    let mut names = Names { taken: files.iter().cloned().collect() };
+    let mut names = Names { taken: files.iter().cloned().collect(), dest: dest.map(Path::to_path_buf) };
     let first = files.first().ok_or_else(|| anyhow!("nothing selected"))?;
     match op {
         Op::Convert(target) => files.iter().map(|f| convert_job(f, target, scratch, &mut names)).collect(),
@@ -672,8 +686,9 @@ fn run_step(step: &Step) -> Result<()> {
 
 /// Runs `op` on `files` and returns what it produced. Blocks: call it off the UI thread.
 /// A job that fails leaves nothing behind; earlier, successful jobs are kept.
-/// `params` are the settings of a tool that asks for them.
-pub fn run(op: Op, files: &[PathBuf], params: Option<&Params>) -> Result<Vec<PathBuf>> {
+/// `params` are the settings of a tool that asks for them. Results go to `dest` (created if
+/// needed) or, when `None`, next to each input.
+pub fn run(op: Op, files: &[PathBuf], params: Option<&Params>, dest: Option<&Path>) -> Result<Vec<PathBuf>> {
     if let Op::Tool(tool) = op
         && tool.needs_params()
         && params.is_none()
@@ -681,8 +696,11 @@ pub fn run(op: Op, files: &[PathBuf], params: Option<&Params>) -> Result<Vec<Pat
         bail!("{} needs settings", op.label());
     }
     let scratch = tempfile::Builder::new().prefix("clementine-").tempdir()?;
+    if let Some(dest) = dest {
+        std::fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
+    }
     let mut produced = Vec::new();
-    for job in plan(op, files, params, scratch.path())? {
+    for job in plan_in(op, files, params, scratch.path(), dest)? {
         if let Err(e) = job.steps.iter().try_for_each(run_step) {
             for out in &job.outputs {
                 let _ = if out.is_dir() { std::fs::remove_dir_all(out) } else { std::fs::remove_file(out) };
@@ -804,6 +822,24 @@ mod tests {
     }
 
     #[test]
+    fn outputs_go_to_the_chosen_folder_without_overwriting() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("results");
+        std::fs::create_dir(&out).unwrap();
+        std::fs::write(out.join("a.jpg"), b"keep me").unwrap();
+        let files = vec![dir.path().join("a.png"), dir.path().join("sub/b.png")];
+        let jobs = plan_in(Op::Convert("jpg"), &files, None, Path::new("/tmp/scratch"), Some(&out)).unwrap();
+        let outputs: Vec<_> = jobs.iter().flat_map(|j| j.outputs.clone()).collect();
+        assert_eq!(outputs, vec![out.join("a (2).jpg"), out.join("b.jpg")]);
+        // Tools and whole-selection ops follow the same rule.
+        let zip = plan_in(Op::Tool(Tool::Zip), &files, None, Path::new("/tmp/scratch"), Some(&out)).unwrap();
+        assert_eq!(zip[0].outputs, vec![out.join("Archive.zip")]);
+        // Without a folder, nothing changes.
+        let jobs = plan(Op::Convert("jpg"), &files, None, Path::new("/tmp/scratch")).unwrap();
+        assert_eq!(jobs[0].outputs, vec![dir.path().join("a.jpg")]);
+    }
+
+    #[test]
     fn stem_drops_double_extensions() {
         assert_eq!(stem(Path::new("/x/backup.tar.gz")), "backup");
         assert_eq!(stem(Path::new("/x/photo.v2.JPG")), "photo.v2");
@@ -855,8 +891,27 @@ mod tests {
     }
 
     #[test]
+    fn asking_tools_honour_the_output_folder() {
+        let out = PathBuf::from("/nonexistent-out");
+        for (file, tool) in [
+            ("a.mp4", Tool::Trim),
+            ("a.wav", Tool::SplitMedia),
+            ("a.png", Tool::CropImage),
+            ("a.pdf", Tool::ExtractPages),
+        ] {
+            let files = vec![PathBuf::from(format!("/nonexistent/{file}"))];
+            let jobs = plan_in(Op::Tool(tool), &files, None, Path::new("/s"), Some(&out)).unwrap();
+            assert!(
+                jobs[0].outputs.iter().all(|o| o.parent() == Some(out.as_path())),
+                "{tool:?} {:?}",
+                jobs[0].outputs
+            );
+        }
+    }
+
+    #[test]
     fn asking_tools_refuse_to_run_without_settings() {
-        let err = run(Op::Tool(Tool::Trim), &[PathBuf::from("/nonexistent/a.mp3")], None).unwrap_err();
+        let err = run(Op::Tool(Tool::Trim), &[PathBuf::from("/nonexistent/a.mp3")], None, None).unwrap_err();
         assert!(err.to_string().contains("needs settings"));
     }
 
@@ -1066,7 +1121,7 @@ mod real {
                         None => name.clone(),
                     };
                     ran += 1;
-                    match run(op, &files, params.as_ref()) {
+                    match run(op, &files, params.as_ref(), None) {
                         Ok(outs)
                             if outs.iter().all(|o| {
                                 o.is_dir() && std::fs::read_dir(o).unwrap().next().is_some()

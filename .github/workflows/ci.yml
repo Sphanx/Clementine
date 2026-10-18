@@ -19,3 +19,29 @@ jobs:
       - run: cargo test
       # Every conversion on real files; LibreOffice ops are skipped here (not installed).
       - run: cargo test -- --ignored --nocapture
+
+  deb:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GTK
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+      - name: Build the .deb
+        run: cargo deb
+      - name: Check the package contents
+        run: |
+          deb=$(ls target/debian/*.deb)
+          dpkg-deb -I "$deb"
+          dpkg-deb -c "$deb" | grep -E 'usr/bin/clementine|\.desktop|metainfo|\.svg'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clementine-deb
+          path: target/debian/*.deb
+          retention-days: 30
+          if-no-files-found: error
