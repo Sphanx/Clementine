@@ -48,8 +48,18 @@ impl Cmd {
 pub enum Step {
     Run(Cmd),
     MkDir(PathBuf),
-    Move { from: PathBuf, to: PathBuf },
-    SubtitleToText { from: PathBuf, to: PathBuf },
+    Move {
+        from: PathBuf,
+        to: PathBuf,
+    },
+    SubtitleToText {
+        from: PathBuf,
+        to: PathBuf,
+    },
+    /// Refuses an archive with an entry named outside the folder it unpacks into.
+    CheckArchive(PathBuf),
+    /// Removes what an extraction left in this folder that leads outside it (see [`confine`]).
+    Confine(PathBuf),
 }
 
 /// The steps for one output (or one group of outputs) and what they produce.
@@ -235,20 +245,103 @@ fn pdf_pages(steps: &mut Vec<Step>, pdf: &Path, image: &str, dir: &Path, name: &
     steps.push(Step::Run(Cmd::new("pdftoppm").args(["-r", "300", format]).arg(pdf).arg(dir.join(name))));
 }
 
-fn extract(input: &Path, dest: &Path) -> Step {
+/// Unpacks `input` into the empty folder `dest`, never outside it: entry names are checked before
+/// anything is written, and links or device files leading out are removed afterwards.
+fn extract(input: &Path, dest: &Path) -> Vec<Step> {
     let ext = extension(input);
     let cmd = match ext.as_str() {
         "zip" => Cmd::new("unzip").arg("-q").arg(input).arg("-d").arg(dest),
-        "rar" => Cmd::new("unrar").args(["x", "-o+", "-idq"]).arg(input).arg(format!("{}/", dest.display())),
+        "rar" => Cmd::new("unrar").args(["x", "-o+", "-idq", "-p-"]).arg(input).arg(format!("{}/", dest.display())),
         "7z" => Cmd::new("7z").args(["x", "-y", "-bd"]).arg(format!("-o{}", dest.display())).arg(input),
         "gz" => {
             let mut c = Cmd::new("gzip").args(["-dc"]).arg(input);
             c.stdout = Some(dest.join(stem(input)));
-            c
+            return vec![Step::Run(c)];
         }
-        _ => Cmd::new("tar").arg("-xf").arg(input).arg("-C").arg(dest),
+        _ => Cmd::new("tar").args(["--no-same-owner", "--no-same-permissions", "-xf"]).arg(input).arg("-C").arg(dest),
     };
-    Step::Run(cmd)
+    vec![Step::CheckArchive(input.to_path_buf()), Step::Run(cmd), Step::Confine(dest.to_path_buf())]
+}
+
+/// The entry names of an archive, from its own tool's listing.
+fn archive_entries(input: &Path) -> Result<Vec<String>> {
+    let (program, args, prefix): (&str, &[&str], Option<&str>) = match extension(input).as_str() {
+        "zip" => ("unzip", &["-Z1"], None),
+        "rar" => ("unrar", &["lb", "-p-"], None),
+        "7z" => ("7z", &["l", "-ba", "-slt"], Some("Path = ")),
+        _ => ("tar", &["-tf"], None),
+    };
+    let out = Command::new(program)
+        .args(args)
+        .arg(input)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .with_context(|| format!("could not start {program}"))?;
+    if !out.status.success() {
+        bail!("{program} could not list {}", input.display());
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    Ok(text
+        .lines()
+        .filter_map(|l| match prefix {
+            Some(p) => l.strip_prefix(p),
+            None => Some(l),
+        })
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// An entry name that would land outside the folder it is extracted into.
+fn unsafe_entry(name: &str) -> bool {
+    name.starts_with('/') || name.starts_with('\\') || name.split(['/', '\\']).any(|part| part == "..")
+}
+
+/// Removes every symlink under `root` that leads outside it, and anything that is neither a file,
+/// a folder nor a link (devices, pipes). Never follows a link while walking.
+fn confine(root: &Path) -> Result<()> {
+    let base = root.canonicalize()?;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            let kind = std::fs::symlink_metadata(&path)?.file_type();
+            if kind.is_dir() {
+                stack.push(path);
+            } else if kind.is_symlink() {
+                let target = std::fs::read_link(&path)?;
+                let rel = path.parent().unwrap_or(root).strip_prefix(root).unwrap_or(Path::new("")).join(&target);
+                let escapes = target.is_absolute()
+                    || climbs_out(&rel)
+                    || path.canonicalize().is_ok_and(|real| !real.starts_with(&base));
+                if escapes {
+                    std::fs::remove_file(&path)?;
+                }
+            } else if !kind.is_file() {
+                std::fs::remove_file(&path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether a relative path, read without touching the disk, ever climbs above where it starts.
+fn climbs_out(rel: &Path) -> bool {
+    use std::path::Component;
+    let mut depth = 0i32;
+    for c in rel.components() {
+        match c {
+            Component::ParentDir => depth -= 1,
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) => return true,
+        }
+        if depth < 0 {
+            return true;
+        }
+    }
+    false
 }
 
 fn convert_job(input: &Path, target: &'static str, scratch: &Path, names: &mut Names) -> Result<Job> {
@@ -318,9 +411,10 @@ fn convert_job(input: &Path, target: &'static str, scratch: &Path, names: &mut N
         Kind::Archive => {
             let unpacked = scratch.join(format!("x-{name}"));
             steps.push(Step::MkDir(unpacked.clone()));
-            steps.push(extract(input, &unpacked));
+            steps.extend(extract(input, &unpacked));
             let pack = match target {
-                "zip" => Cmd::new("zip").args(["-r", "-q"]).arg(&out).arg("."),
+                // `-y` stores links as links: an archive's link must never pull in the file it names.
+                "zip" => Cmd::new("zip").args(["-r", "-q", "-y"]).arg(&out).arg("."),
                 "tar" => Cmd::new("tar").arg("-cf").arg(&out).arg("."),
                 _ => Cmd::new("tar").arg("-czf").arg(&out).arg("."),
             };
@@ -560,7 +654,7 @@ fn tool_job(input: &Path, tool: Tool, setup: &Setup, names: &mut Names) -> Resul
         Tool::Extract => {
             let out = names.claim(&dir, &name, "");
             steps.push(Step::MkDir(out.clone()));
-            steps.push(extract(input, &out));
+            steps.extend(extract(input, &out));
             out
         }
         Tool::MergePdf | Tool::Zip => bail!("{tool:?} works on the whole selection"),
@@ -681,6 +775,11 @@ fn run_step(step: &Step) -> Result<()> {
             let text = std::fs::read_to_string(from)?;
             Ok(std::fs::write(to, subtitle_text(&text))?)
         }
+        Step::CheckArchive(archive) => match archive_entries(archive)?.into_iter().find(|e| unsafe_entry(e)) {
+            Some(bad) => bail!("refusing {}: its entry {bad:?} points outside the folder", archive.display()),
+            None => Ok(()),
+        },
+        Step::Confine(dir) => confine(dir),
     }
 }
 
@@ -1143,3 +1242,7 @@ mod real {
         assert!(failures.is_empty(), "\n{}", failures.join("\n"));
     }
 }
+
+#[cfg(test)]
+#[path = "security_tests.rs"]
+mod security_tests;
