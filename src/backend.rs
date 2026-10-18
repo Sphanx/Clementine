@@ -168,7 +168,8 @@ fn ffmpeg_from(input: &Path, start: f64) -> Cmd {
     if start > 0.0 {
         cmd = cmd.arg("-ss").arg(trim_number(start));
     }
-    cmd.arg("-i").arg(input)
+    // Only plain local files: a disguised playlist or subtitle cannot make ffmpeg fetch URLs.
+    cmd.args(["-protocol_whitelist", "file"]).arg("-i").arg(input)
 }
 
 const X264_HQ: &[&str] =
@@ -460,6 +461,40 @@ fn convert_job(input: &Path, target: &'static str, scratch: &Path, names: &mut N
     Ok(Job { steps, outputs: vec![out] })
 }
 
+/// What keeps pandoc from reading files other than its input, or the network: `--sandbox` when it
+/// works (2.15 and later; some 3.1 builds cannot read their own templates in it), otherwise a Lua
+/// filter dropping images named outside the document's folder or by URL.
+fn pandoc_guard() -> &'static [OsString] {
+    static GUARD: std::sync::OnceLock<Vec<OsString>> = std::sync::OnceLock::new();
+    GUARD.get_or_init(|| {
+        let Ok(dir) = tempfile::Builder::new().prefix("clementine-pandoc-").tempdir() else { return Vec::new() };
+        let probe_in = dir.path().join("probe.md");
+        let probe_out = dir.path().join("probe.docx");
+        let sandbox_works = std::fs::write(&probe_in, "probe\n").is_ok()
+            && command("pandoc")
+                .arg("--sandbox")
+                .arg("-o")
+                .arg(&probe_out)
+                .arg(&probe_in)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+        if sandbox_works {
+            return vec!["--sandbox".into()];
+        }
+        let filter = dir.path().join("local-only.lua");
+        if std::fs::write(&filter, include_str!("../data/pandoc/local-only.lua")).is_err() {
+            return Vec::new();
+        }
+        let _ = std::fs::remove_file(&probe_in);
+        let mut arg = OsString::from("--lua-filter=");
+        arg.push(dir.keep().join("local-only.lua"));
+        vec![arg]
+    })
+}
+
 fn pandoc(input: &Path, src: &str, target: &str, out: &Path) -> Cmd {
     let reader = match src {
         "md" | "txt" => "markdown",
@@ -471,6 +506,7 @@ fn pandoc(input: &Path, src: &str, target: &str, out: &Path) -> Cmd {
         other => other,
     };
     let mut cmd = Cmd::new("pandoc").args(["-f", reader, "-t", writer]);
+    cmd = cmd.args(pandoc_guard().iter().cloned());
     if matches!(target, "html" | "epub") {
         cmd = cmd.arg("--standalone").arg("--metadata").arg(format!("title={}", stem(input)));
     }
@@ -854,7 +890,9 @@ fn capture(program: &str, args: &[&OsStr]) -> Option<String> {
 
 /// A media file's length in seconds, from ffprobe.
 pub fn media_duration(path: &Path) -> Option<f64> {
-    let args = ["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1"].map(OsStr::new);
+    let args =
+        ["-v", "error", "-protocol_whitelist", "file", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1"]
+            .map(OsStr::new);
     let text = capture("ffprobe", &[&args[..], &[path.as_os_str()]].concat())?;
     text.lines().next()?.trim().parse().ok().filter(|d: &f64| d.is_finite() && *d > 0.0)
 }

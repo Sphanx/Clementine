@@ -183,3 +183,57 @@ fn magick_refuses_script_and_text_coders() {
         assert!(run_cmd(&cmd).is_err() && !out.exists(), "{source} was read");
     }
 }
+
+/// A listener on a free local port; the flag turns true if anything connects within a few seconds.
+fn listener() -> (u16, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let hit = std::sync::Arc::new(AtomicBool::new(false));
+    let flag = hit.clone();
+    std::thread::spawn(move || {
+        if l.accept().is_ok() {
+            flag.store(true, Ordering::SeqCst);
+        }
+    });
+    (port, hit)
+}
+
+#[test]
+fn media_playlists_cannot_reach_the_network() {
+    if !has_program("ffmpeg") || !has_program("ffprobe") {
+        return;
+    }
+    let (_root, _secret, input) = sandbox();
+    for name in ["clip.mp4", "song.mp3", "sub.srt"] {
+        let (port, hit) = listener();
+        let file = input.join(name);
+        let playlist = format!(
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1.0,\nhttp://127.0.0.1:{port}/seg.ts\n#EXT-X-ENDLIST\n"
+        );
+        std::fs::write(&file, playlist).unwrap();
+        let target = if name == "sub.srt" { "vtt" } else { "wav" };
+        let _ = run(Op::Convert(target), std::slice::from_ref(&file), None, None);
+        let _ = media_duration(&file);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!hit.load(std::sync::atomic::Ordering::SeqCst), "{name}: ffmpeg fetched a URL from the file");
+    }
+}
+
+#[test]
+fn documents_cannot_embed_local_files() {
+    if !has_program("pandoc") {
+        return;
+    }
+    let (_root, secret, input) = sandbox();
+    let private = secret.with_file_name("private.png");
+    assert!(run_cmd(&Cmd::new(magick()).arg("xc:red").arg(&private)).is_ok());
+    let md = input.join("notes.md");
+    std::fs::write(&md, format!("# Notes\n\n![x]({})\n", private.display())).unwrap();
+    for target in ["docx", "epub"] {
+        let Ok(out) = run(Op::Convert(target), std::slice::from_ref(&md), None, None) else { continue };
+        let listing = Command::new("unzip").arg("-Z1").arg(&out[0]).output().unwrap();
+        let names = String::from_utf8_lossy(&listing.stdout);
+        assert!(!names.lines().any(|l| l.contains("media/")), "{target} embedded a local file:\n{names}");
+    }
+}
