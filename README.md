@@ -19,9 +19,16 @@ results land next to it (or in a folder you choose) as `name.ext`, or `name (2).
 The wheel stays open until you drop. Drop on a slice to run it, or on the hub to cancel.
 A drop without a wheel puts the files on the **shelf**.
 
-**Wayland:** a window is not told about keys pressed while a drag from *another* app hovers it.
-So while dragging, three chips appear at the bottom of the window; drag over one to open its wheel.
-Modifier keys work when dragging from the shelf, and on X11.
+A tap is enough: the wheel opens at the pointer on the key press and stays open after the release,
+even if the pointer has not moved. Pressing another wheel's key switches to that wheel.
+
+**Where modifier keys work:** on **X11** from any app and from the shelf (the keyboard state is read
+from the display, since a drag holds the keyboard grab and its events carry no modifiers). On
+**Wayland** a window is not told about keys pressed while a drag from *another* app hovers it, so
+there they work only while Susen's window has keyboard focus — dragging a shelf row, for instance.
+For every other case, three chips appear at the bottom of the window while dragging; drag over one to
+open its wheel. (A file manager may show a "move" or "link" cursor while you hold Shift or Ctrl —
+on X11 those keys also pick the drag action — but Susen only reads the files; it never moves them.)
 
 **Keyboard:** select files on the shelf and press **Enter** (or the **Menu** key, or **Shift+F10**).
 Arrows choose a slice, **Home**/**End** jump to the first/last one, **1**–**9** run slice N directly,
