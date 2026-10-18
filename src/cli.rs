@@ -412,14 +412,25 @@ fn notify_send(summary: &str, body: &str) {
     if std::io::stderr().is_terminal() && std::env::var_os("CLEMENTINE_FORCE_NOTIFY").is_none() {
         return;
     }
-    let _ = Process::new("notify-send")
-        .args(["--app-name=Clementine", "--icon=io.github.sphanx.Clementine", summary, body])
-        .status();
+    let _ = Process::new("notify-send").args(notify_args(summary, body)).status();
+}
+
+/// `notify-send`'s arguments. File names and tool errors come from untrusted files, so `--` ends
+/// the options: a name like `--action=…` is shown, never parsed.
+fn notify_args<'a>(summary: &'a str, body: &'a str) -> [&'a str; 5] {
+    ["--app-name=Clementine", "--icon=io.github.sphanx.Clementine", "--", summary, body]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notification_text_is_never_an_option() {
+        let args = notify_args("--wait", "-x.png");
+        let dashes = args.iter().position(|a| *a == "--").expect("no -- before the text");
+        assert!(dashes < args.iter().position(|a| *a == "--wait").unwrap());
+    }
 
     fn args(list: &[&str]) -> Vec<OsString> {
         list.iter().map(OsString::from).collect()

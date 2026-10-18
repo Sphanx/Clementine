@@ -6,6 +6,8 @@
 cmd=${CLEMENTINE_COMMAND:-clementine}
 if [ -n "$NAUTILUS_SCRIPT_SELECTED_FILE_PATHS" ]; then
     # One absolute path per line; the variable is empty for remote locations.
+    # No globbing: a file named "*" must stay one file, not the whole folder.
+    set -f
     old_ifs=$IFS
     IFS='
 '
