@@ -18,7 +18,8 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
       # Every conversion on real files; LibreOffice ops are skipped here (not installed).
-      - run: cargo test -- --ignored --nocapture
+      # Tests named bug_ reproduce open bugs and are expected to fail.
+      - run: cargo test -- --ignored --nocapture --skip bug_
 
   deb:
     runs-on: ubuntu-24.04

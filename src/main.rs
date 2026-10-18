@@ -15,6 +15,9 @@ mod params_ui;
 mod settings_ui;
 mod wheel;
 
+#[cfg(test)]
+mod qa_tests;
+
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;

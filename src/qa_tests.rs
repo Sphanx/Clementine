@@ -1,0 +1,1195 @@
+//! QA tests: catalog consistency, more real formats, hostile file names, broken inputs and
+//! concurrent runs. Everything that touches real converters is `#[ignore]`d (slow); tests named
+//! `bug_…` reproduce known bugs that are not fixed yet and are expected to fail:
+//!
+//! ```sh
+//! cargo test -- --ignored --skip bug_     # everything that should pass
+//! cargo test bug_ -- --ignored            # the open bugs
+//! ```
+
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
+
+use crate::backend::{
+    self, Step, has_program, image_size, media_duration, missing_programs, pdf_page_count, plan, run,
+};
+use crate::catalog::{Kind, Mode, Op, Tool, canonical, extension, kind_of, options, targets};
+use crate::params::{Crop, Params, Resize, SplitBy};
+
+/// Every kind with a wheel, and a representative extension list for it (aliases included).
+const EXTS: &[(Kind, &[&str])] = &[
+    (Kind::Image, &["jpg", "jpeg", "png", "webp", "heic", "heif", "tif", "tiff", "avif", "bmp", "gif", "svg"]),
+    (Kind::Audio, &["mp3", "m4a", "wav", "flac", "ogg", "oga", "opus", "aif", "aiff", "wma", "aac"]),
+    (Kind::Video, &["mp4", "m4v", "mov", "mkv", "webm", "avi", "wmv", "mpg", "mpeg", "flv"]),
+    (Kind::Pdf, &["pdf"]),
+    (Kind::Document, &["docx", "odt", "rtf", "md", "markdown", "txt", "html", "htm", "epub"]),
+    (Kind::Spreadsheet, &["xlsx", "xls", "ods", "csv", "tsv"]),
+    (Kind::Slides, &["pptx", "ppt", "odp"]),
+    (Kind::Subtitle, &["srt", "vtt"]),
+    (Kind::Archive, &["zip", "tar", "tar.gz", "gz", "tgz", "rar", "7z"]),
+];
+
+fn fake(name: &str) -> PathBuf {
+    PathBuf::from(format!("/nonexistent-qa/{name}"))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Catalog consistency (fast)
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn every_extension_has_the_kind_it_is_listed_under() {
+    for (kind, exts) in EXTS {
+        for ext in *exts {
+            for name in [format!("a.{ext}"), format!("A.{}", ext.to_uppercase())] {
+                assert_eq!(kind_of(&fake(&name)), *kind, "{name}");
+            }
+        }
+    }
+}
+
+#[test]
+fn aliases_fold_to_a_member_of_the_same_kind() {
+    for (kind, exts) in EXTS {
+        for ext in *exts {
+            let c = canonical(ext);
+            // The canonical form must itself be recognised as the same kind…
+            assert_eq!(kind_of(&fake(&format!("a.{c}"))), *kind, "{ext} → {c}");
+            // …and canonical must be idempotent.
+            assert_eq!(canonical(c), c, "{ext}");
+        }
+    }
+    // Every target is already canonical, so `own_format_is_not_offered` can compare them.
+    for (kind, _) in EXTS {
+        for t in targets(*kind) {
+            assert_eq!(canonical(t), *t, "{kind:?} target {t}");
+        }
+    }
+}
+
+#[test]
+fn an_alias_is_never_offered_its_own_format() {
+    for (alias, canon) in
+        [("jpeg", "jpg"), ("tif", "tiff"), ("heif", "heic"), ("htm", "html"), ("tgz", "tar.gz"), ("aif", "aiff")]
+    {
+        let ops = options(Mode::Convert, &[fake(&format!("a.{alias}"))]);
+        assert!(!ops.contains(&Op::Convert(canon)), "a.{alias} is offered {canon}: {ops:?}");
+        let upper = options(Mode::Convert, &[fake(&format!("A.{}", alias.to_uppercase()))]);
+        assert_eq!(ops, upper, "{alias} upper case");
+    }
+}
+
+#[test]
+fn every_target_of_every_extension_plans_and_never_overwrites() {
+    let scratch = Path::new("/nonexistent-qa-scratch");
+    for (_, exts) in EXTS {
+        for ext in *exts {
+            let files = vec![fake(&format!("a.{ext}"))];
+            for mode in [Mode::Convert, Mode::Tools] {
+                for op in options(mode, &files) {
+                    let jobs = plan(op, &files, None, scratch).unwrap_or_else(|e| panic!("a.{ext} {op:?}: {e}"));
+                    assert!(!jobs.is_empty(), "a.{ext} {op:?}");
+                    for out in jobs.iter().flat_map(|j| &j.outputs) {
+                        assert_ne!(out, &files[0], "a.{ext} {op:?} overwrites its input");
+                        assert_eq!(out.parent(), files[0].parent(), "a.{ext} {op:?} writes elsewhere: {out:?}");
+                    }
+                    // A conversion's output carries the target's extension (or is a folder of pages).
+                    if let Op::Convert(t) = op {
+                        let out = &jobs[0].outputs[0];
+                        let ok = extension(out) == t || out.extension().is_none();
+                        assert!(ok, "a.{ext} → {t} is named {out:?}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn labels_are_unique_within_every_wheel() {
+    let mut selections: Vec<Vec<PathBuf>> = Vec::new();
+    for (_, exts) in EXTS {
+        selections.push(vec![fake(&format!("a.{}", exts[0]))]);
+        selections.push(vec![fake(&format!("a.{}", exts[0])), fake(&format!("b.{}", exts[exts.len() - 1]))]);
+    }
+    selections.push(vec![fake("a.png"), fake("b.mp3")]);
+    selections.push(vec![fake("folderish")]);
+    for files in &selections {
+        for mode in [Mode::Convert, Mode::Tools, Mode::Actions] {
+            let ops = options(mode, files);
+            let labels: HashSet<String> = ops.iter().map(Op::label).collect();
+            assert_eq!(labels.len(), ops.len(), "{mode:?} {files:?}: {ops:?}");
+        }
+    }
+}
+
+#[test]
+fn mixed_selections_of_one_kind_convert_and_offer_tools() {
+    // Aliases and different formats of one kind still share a wheel.
+    let files = [fake("a.jpeg"), fake("b.JPG")];
+    let ops = options(Mode::Convert, &files);
+    assert!(!ops.contains(&Op::Convert("jpg")) && ops.contains(&Op::Convert("png")), "{ops:?}");
+    let files = [fake("a.png"), fake("b.webp")];
+    assert!(options(Mode::Convert, &files).contains(&Op::Convert("png")));
+    assert!(options(Mode::Tools, &files).contains(&Op::Tool(Tool::Resize)));
+    // Two kinds: actions and Zip only.
+    let files = [fake("a.pdf"), fake("b.png")];
+    assert!(options(Mode::Convert, &files).is_empty());
+    assert_eq!(options(Mode::Tools, &files), vec![Op::Tool(Tool::Zip)]);
+    // Nothing selected: nothing at all.
+    assert!(options(Mode::Convert, &[]).is_empty() && options(Mode::Tools, &[]).is_empty());
+}
+
+#[test]
+fn an_ops_programs_are_reported_missing_by_name() {
+    // `missing_programs` must never panic or plan into the scratch stand-in for any op.
+    for (_, exts) in EXTS {
+        for ext in *exts {
+            let files = vec![fake(&format!("a.{ext}"))];
+            for op in [Mode::Convert, Mode::Tools].into_iter().flat_map(|m| options(m, &files)) {
+                for p in missing_programs(op, &files) {
+                    assert!(!p.is_empty() && !p.contains('/'), "{p}");
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Names and arguments (fast)
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn stem_keeps_unicode_and_odd_names() {
+    for (name, want) in [
+        ("çğıöşü İ.png", "çğıöşü İ"),
+        ("emoji 🍊.PNG", "emoji 🍊"),
+        (".hidden.png", ".hidden"),
+        (".bashrc", ".bashrc"),
+        ("noext", "noext"),
+        ("a.tar.gz", "a"),
+        ("a.TAR.GZ", "a"),
+        ("a.gz", "a"),
+        ("pct%d [0].png", "pct%d [0]"),
+    ] {
+        assert_eq!(backend::stem(&fake(name)), want, "{name}");
+    }
+}
+
+/// Regression: an extension whose lower case is longer in bytes (`İ` → `i̇`) cut the stem
+/// inside a character and panicked on the worker thread.
+#[test]
+fn stem_survives_extensions_that_grow_when_lowered() {
+    assert_eq!(backend::stem(&fake("çğıöşü.İ")), "çğıöşü");
+    assert_eq!(backend::stem(&fake("x.İMG")), "x");
+    let jobs = plan(Op::Tool(Tool::Zip), &[fake("çğıöşü.İ")], None, Path::new("/s")).unwrap();
+    assert_eq!(jobs[0].outputs, vec![fake("çğıöşü.zip")]);
+}
+
+fn run_args(op: Op, files: &[PathBuf]) -> Vec<Vec<String>> {
+    let jobs = plan(op, files, None, Path::new("/s")).unwrap();
+    jobs.iter()
+        .flat_map(|j| &j.steps)
+        .filter_map(|s| match s {
+            Step::Run(c) => Some(c.args.iter().map(|a| a.to_string_lossy().into_owned()).collect()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Regression: Zip stores bare names, so `-v.png` was read by zip as an option.
+#[test]
+fn zip_never_reads_a_file_name_as_an_option() {
+    let args = run_args(Op::Tool(Tool::Zip), &[fake("-v.png"), fake("b.png")]);
+    let zip = &args[0];
+    let dashdash = zip.iter().position(|a| a == "--").expect("zip args end options with --");
+    assert!(zip.iter().position(|a| a == "-v.png").unwrap() > dashdash, "{zip:?}");
+}
+
+/// Regression: Ghostscript expands `%d` in `-sOutputFile`, so `scan%d.pdf` became one file per page.
+#[test]
+fn ghostscript_output_escapes_percent() {
+    let args = run_args(Op::Tool(Tool::CompressPdf), &[fake("scan%d.pdf")]);
+    let out = args[0].iter().find(|a| a.starts_with("-sOutputFile=")).unwrap();
+    assert_eq!(out, "-sOutputFile=/nonexistent-qa/scan%%d (compressed).pdf");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Real-file helpers
+// ---------------------------------------------------------------------------------------------
+
+fn sh_in(dir: &Path, program: &str, args: &[&str]) -> bool {
+    Command::new(program)
+        .args(args)
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+fn sh(dir: &Path, program: &str, args: &[&str]) {
+    assert!(sh_in(dir, program, args), "making a sample with {program} {args:?} failed");
+}
+
+fn im() -> &'static str {
+    if has_program("magick") { "magick" } else { "convert" }
+}
+
+/// Whether this ImageMagick can write `format` (HEIC/AVIF need libheif encoder plugins).
+fn im_writes(format: &str) -> bool {
+    let out = Command::new(im()).args(["-list", "format"]).output().map(|o| o.stdout).unwrap_or_default();
+    String::from_utf8_lossy(&out).lines().any(|l| {
+        let mut w = l.split_whitespace();
+        w.next().is_some_and(|f| f.trim_end_matches('*').eq_ignore_ascii_case(format))
+            && l.split_whitespace().any(|m| m.len() == 3 && m.as_bytes()[1] == b'w')
+    })
+}
+
+fn ff(dir: &Path, args: &[&str]) {
+    let mut all = vec!["-hide_banner", "-loglevel", "error", "-y"];
+    all.extend_from_slice(args);
+    sh(dir, "ffmpeg", &all);
+}
+
+/// Runs `f` on a thread; `None` if it did not finish in time (the thread is left behind).
+fn within<T: Send + 'static>(secs: u64, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(Duration::from_secs(secs)).ok()
+}
+
+/// Settings for a tool that asks, sized for 1-second, 64×48, 1+ page samples.
+fn params_for(op: Op) -> Option<Params> {
+    let Op::Tool(t) = op else { return None };
+    Some(match t {
+        Tool::Trim => Params::Trim { start: 0.25, end: 0.75 },
+        Tool::SplitMedia => Params::Split(SplitBy::Parts(2)),
+        Tool::Speed => Params::Speed(2.0),
+        Tool::FadeAudio => Params::Fade { fade_in: 0.2, fade_out: 0.3 },
+        Tool::Thumbnail => Params::Thumbnail { at: 0.5 },
+        Tool::CropImage => Params::Crop(Crop::Aspect(1, 1)),
+        Tool::Resize => Params::Resize(Resize::Percent(50)),
+        Tool::RotatePdf => Params::RotatePages(90),
+        Tool::ExtractPages => Params::Pages { first: 1, last: 1 },
+        _ => return None,
+    })
+}
+
+/// Whether `out` really is a file of the kind its name says (not just non-empty).
+fn looks_valid(out: &Path) -> Result<(), String> {
+    if out.is_dir() {
+        let entries: Vec<PathBuf> =
+            std::fs::read_dir(out).map_err(|e| e.to_string())?.flatten().map(|e| e.path()).collect();
+        if entries.is_empty() {
+            return Err(format!("{} is an empty folder", out.display()));
+        }
+        return entries.iter().try_for_each(|e| looks_valid(e));
+    }
+    let len = out.metadata().map(|m| m.len()).map_err(|e| format!("{}: {e}", out.display()))?;
+    if len == 0 {
+        return Err(format!("{} is empty", out.display()));
+    }
+    let ok = match kind_of(out) {
+        Kind::Image => image_size(out).is_some(),
+        Kind::Audio | Kind::Video => media_duration(out).is_some(),
+        Kind::Pdf => pdf_page_count(out).is_some_and(|n| n > 0),
+        Kind::Archive if extension(out) == "zip" => sh_in(Path::new("/"), "unzip", &["-tqq", &out.to_string_lossy()]),
+        Kind::Archive => sh_in(Path::new("/"), "tar", &["-tf", &out.to_string_lossy()]),
+        _ => true,
+    };
+    if ok { Ok(()) } else { Err(format!("{} does not read back as {}", out.display(), extension(out))) }
+}
+
+/// Everything under `dir`, recursively, as relative paths.
+fn listing(dir: &Path) -> HashSet<PathBuf> {
+    fn walk(base: &Path, d: &Path, acc: &mut HashSet<PathBuf>) {
+        for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
+            let p = e.path();
+            acc.insert(p.strip_prefix(base).unwrap().to_path_buf());
+            if p.is_dir() {
+                walk(base, &p, acc);
+            }
+        }
+    }
+    let mut acc = HashSet::new();
+    walk(dir, dir, &mut acc);
+    acc
+}
+
+/// Runs `op` on `files` with a timeout and checks the result: outputs valid, and nothing
+/// appeared in `dir` that is not one of them (or inside one of them).
+fn run_checked(op: Op, files: &[PathBuf], dir: &Path, secs: u64) -> Result<Vec<PathBuf>, String> {
+    let before = listing(dir);
+    let params = params_for(op);
+    let f = files.to_vec();
+    let result = within(secs, move || run(op, &f, params.as_ref(), None).map_err(|e| format!("{e:#}")))
+        .ok_or_else(|| format!("timed out after {secs} s"))??;
+    for out in &result {
+        looks_valid(out)?;
+    }
+    let stray: Vec<PathBuf> = listing(dir)
+        .difference(&before)
+        .filter(|p| !result.iter().any(|o| dir.join(p).starts_with(o)))
+        .cloned()
+        .collect();
+    if !stray.is_empty() {
+        return Err(format!("left files it did not report: {stray:?} (reported {result:?})"));
+    }
+    Ok(result)
+}
+
+/// Like [`run_checked`] for an input that must fail: an error, in time, with nothing left behind.
+fn run_failing(op: Op, files: &[PathBuf], dir: &Path, secs: u64) -> Result<String, String> {
+    let before = listing(dir);
+    let params = params_for(op);
+    let f = files.to_vec();
+    let result = within(secs, move || {
+        std::panic::catch_unwind(|| run(op, &f, params.as_ref(), None).map_err(|e| format!("{e:#}")))
+    })
+    .ok_or_else(|| format!("timed out after {secs} s"))?
+    .map_err(|_| "panicked".to_string())?;
+    let after = listing(dir);
+    let left: Vec<_> = after.difference(&before).collect();
+    match result {
+        Ok(outs) => Err(format!("succeeded: {outs:?}")),
+        Err(_) if !left.is_empty() => Err(format!("failed but left {left:?}")),
+        Err(e) if e.trim().is_empty() => Err("failed with an empty message".into()),
+        Err(e) => Ok(e),
+    }
+}
+
+fn every_op(files: &[PathBuf]) -> Vec<Op> {
+    [Mode::Convert, Mode::Tools].into_iter().flat_map(|m| options(m, files)).collect()
+}
+
+/// Ops whose programs are present (HEIC/AVIF also need an ImageMagick that can write them).
+fn runnable(op: Op, files: &[PathBuf]) -> Result<(), String> {
+    let missing = missing_programs(op, files);
+    if !missing.is_empty() {
+        return Err(format!("needs {}", missing.join(", ")));
+    }
+    if let Op::Convert(t @ ("heic" | "avif")) = op
+        && kind_of(&files[0]) == Kind::Image
+        && !im_writes(t)
+    {
+        return Err(format!("ImageMagick cannot write {t} here"));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// More formats, for real
+// ---------------------------------------------------------------------------------------------
+
+/// A minimal ODP (one slide with a title), zipped with `zip` the way ODF wants it.
+fn write_odp(dir: &Path, name: &str) {
+    let src = dir.join(format!("{name}-src"));
+    std::fs::create_dir_all(src.join("META-INF")).unwrap();
+    std::fs::write(src.join("mimetype"), "application/vnd.oasis.opendocument.presentation").unwrap();
+    std::fs::write(
+        src.join("META-INF/manifest.xml"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.2">
+ <manifest:file-entry manifest:full-path="/" manifest:media-type="application/vnd.oasis.opendocument.presentation"/>
+ <manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/>
+</manifest:manifest>"#,
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("content.xml"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"
+ xmlns:presentation="urn:oasis:names:tc:opendocument:xmlns:presentation:1.0" office:version="1.2">
+ <office:body><office:presentation>
+  <draw:page draw:name="One">
+   <draw:frame svg:x="2cm" svg:y="2cm" svg:width="20cm" svg:height="3cm"><draw:text-box>
+    <text:p>Hello slides</text:p></draw:text-box></draw:frame>
+  </draw:page>
+  <draw:page draw:name="Two">
+   <draw:frame svg:x="2cm" svg:y="2cm" svg:width="20cm" svg:height="3cm"><draw:text-box>
+    <text:p>Second</text:p></draw:text-box></draw:frame>
+  </draw:page>
+ </office:presentation></office:body>
+</office:document-content>"#,
+    )
+    .unwrap();
+    let out = dir.join(format!("{name}.odp"));
+    sh(&src, "zip", &["-X", "-0", "-q", &out.to_string_lossy(), "mimetype"]);
+    sh(&src, "zip", &["-X", "-r", "-q", &out.to_string_lossy(), "content.xml", "META-INF"]);
+    std::fs::remove_dir_all(&src).unwrap();
+}
+
+/// LibreOffice into `dir`, from a sample already there; the result is renamed to `to`.
+fn lo(dir: &Path, from: &str, ext: &str, to: &str) -> bool {
+    let tmp = dir.join(format!("lo-{to}"));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let ok = sh_in(
+        dir,
+        "soffice",
+        &["--headless", "--norestore", "--convert-to", ext, "--outdir", &tmp.to_string_lossy(), from],
+    );
+    let made = std::fs::read_dir(&tmp).unwrap().flatten().next().map(|e| e.path());
+    let ok = ok && made.is_some_and(|m| std::fs::rename(m, dir.join(to)).is_ok());
+    std::fs::remove_dir_all(&tmp).unwrap();
+    ok
+}
+
+/// Samples of the formats the stock real test does not cover. Each has its own stem, so no two
+/// samples ever compete for an output name.
+fn more_samples(dir: &Path) -> Vec<PathBuf> {
+    let mut names: Vec<String> = Vec::new();
+    let mut add = |n: &str| names.push(n.to_string());
+    let lavfi = |s: &str| ["-f", "lavfi", "-i", s].map(String::from);
+
+    // Images.
+    sh(dir, im(), &["-size", "64x48", "gradient:orange-white", "base.png"]);
+    for (ext, name) in [("webp", "i_webp.webp"), ("tif", "i_tif.TIF"), ("bmp", "i_bmp.bmp"), ("jpg", "i_jpeg.jpeg")] {
+        sh(dir, im(), &["base.png", &format!("{ext}:{name}")]);
+        add(name);
+    }
+    for (fmt, name) in [("heic", "i_heic.heic"), ("avif", "i_avif.avif")] {
+        if im_writes(fmt) {
+            sh(dir, im(), &["base.png", name]);
+            add(name);
+        } else {
+            println!("no {fmt} sample: ImageMagick cannot write it");
+        }
+    }
+    std::fs::write(
+        dir.join("i_svg.svg"),
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="64" height="48"><rect width="64" height="48" fill="orange"/></svg>"#,
+    )
+    .unwrap();
+    add("i_svg.svg");
+    // A two-frame TIFF, to check only the first frame is taken.
+    sh(dir, im(), &["base.png", "base.png", "i_multi.tiff"]);
+    add("i_multi.tiff");
+    std::fs::remove_file(dir.join("base.png")).unwrap();
+
+    // Audio.
+    let sine: Vec<String> = [&lavfi("sine=frequency=440:duration=1")[..], &["-ac".into(), "2".into()]].concat();
+    for (name, codec) in [
+        ("a_ogg.ogg", &["-c:a", "libvorbis"][..]),
+        ("a_opus.opus", &["-c:a", "libopus"]),
+        ("a_flac.flac", &["-c:a", "flac"]),
+        ("a_m4a.m4a", &["-c:a", "aac"]),
+        ("a_wma.wma", &["-c:a", "wmav2"]),
+        ("a_aac.aac", &["-c:a", "aac"]),
+        ("a_aiff.aif", &["-c:a", "pcm_s16be"]),
+    ] {
+        let mut args: Vec<&str> = sine.iter().map(String::as_str).collect();
+        args.extend_from_slice(codec);
+        args.push(name);
+        ff(dir, &args);
+        add(name);
+    }
+
+    // Video.
+    let src: Vec<String> = [
+        &lavfi("testsrc=size=128x96:rate=25:duration=1")[..],
+        &lavfi("sine=duration=1"),
+        &["-shortest".into(), "-pix_fmt".into(), "yuv420p".into()],
+    ]
+    .concat();
+    for (name, codec) in [
+        ("v_mov.mov", &["-c:v", "libx264", "-c:a", "aac"][..]),
+        ("v_mkv.mkv", &["-c:v", "libx264", "-c:a", "aac"]),
+        ("v_webm.webm", &["-c:v", "libvpx-vp9", "-c:a", "libopus"]),
+        ("v_avi.avi", &["-c:v", "mpeg4", "-c:a", "libmp3lame"]),
+        ("v_wmv.wmv", &["-c:v", "wmv2", "-c:a", "wmav2"]),
+        ("v_mpg.mpg", &["-c:v", "mpeg2video", "-c:a", "mp2"]),
+        ("v_flv.flv", &["-c:v", "flv1", "-c:a", "libmp3lame", "-ar", "44100"]),
+        ("v_m4v.m4v", &["-c:v", "libx264", "-c:a", "aac"]),
+    ] {
+        let mut args: Vec<&str> = src.iter().map(String::as_str).collect();
+        args.extend_from_slice(codec);
+        args.push(name);
+        ff(dir, &args);
+        add(name);
+    }
+
+    // Subtitles and documents.
+    std::fs::write(
+        dir.join("s_vtt.vtt"),
+        "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n<i>Hello</i> there\n\n00:00:03.000 --> 00:00:04.500\nSecond line\n",
+    )
+    .unwrap();
+    add("s_vtt.vtt");
+    std::fs::write(dir.join("d_txt.txt"), "Plain text\n\nSecond paragraph with ümlaut and İ.\n").unwrap();
+    add("d_txt.txt");
+    std::fs::write(
+        dir.join("d_html.html"),
+        "<!doctype html><html><head><meta charset=utf-8><title>T</title></head><body><h1>Title</h1><p>Some <b>bold</b> text.</p><table><tr><td>1</td><td>2</td></tr></table></body></html>",
+    )
+    .unwrap();
+    add("d_html.html");
+    std::fs::write(dir.join("src.md"), "# Book\n\n## Chapter\n\nSome *text*.\n").unwrap();
+    sh(dir, "pandoc", &["src.md", "-o", "d_epub.epub", "--metadata", "title=Book"]);
+    add("d_epub.epub");
+    sh(dir, "pandoc", &["src.md", "-o", "d_odt.odt"]);
+    add("d_odt.odt");
+    std::fs::rename(dir.join("src.md"), dir.join("d_markdown.markdown")).unwrap();
+    add("d_markdown.markdown");
+
+    // Spreadsheets and slides (LibreOffice).
+    std::fs::write(dir.join("t_tsv.tsv"), "a\tb\n1\t2\n3\t4\n").unwrap();
+    add("t_tsv.tsv");
+    if has_program("soffice") {
+        std::fs::write(dir.join("t.csv"), "a,b\n1,2\n3,4\n").unwrap();
+        for (ext, name) in [("xls", "t_xls.xls"), ("xlsx", "t_xlsx.xlsx"), ("ods", "t_ods.ods")] {
+            assert!(lo(dir, "t.csv", ext, name), "making {name}");
+            add(name);
+        }
+        std::fs::remove_file(dir.join("t.csv")).unwrap();
+        write_odp(dir, "p_odp");
+        add("p_odp.odp");
+        for (ext, name) in [("pptx", "p_pptx.pptx"), ("ppt", "p_ppt.ppt")] {
+            assert!(lo(dir, "p_odp.odp", ext, name), "making {name}");
+            add(name);
+        }
+    } else {
+        println!("no spreadsheet or slide samples: LibreOffice is not installed");
+    }
+
+    // Archives.
+    std::fs::write(dir.join("payload.txt"), "payload\n").unwrap();
+    sh(dir, "tar", &["-cf", "z_tar.tar", "payload.txt"]);
+    add("z_tar.tar");
+    sh(dir, "tar", &["-czf", "z_tgz.tgz", "payload.txt"]);
+    add("z_tgz.tgz");
+    sh(dir, "gzip", &["-k", "payload.txt"]);
+    std::fs::rename(dir.join("payload.txt.gz"), dir.join("z_gz.gz")).unwrap();
+    add("z_gz.gz");
+    if has_program("7z") {
+        sh(dir, "7z", &["a", "-bd", "z_7z.7z", "payload.txt"]);
+        add("z_7z.7z");
+    }
+    if has_program("rar") {
+        sh(dir, "rar", &["a", "-idq", "z_rar.rar", "payload.txt"]);
+        add("z_rar.rar");
+    }
+    std::fs::remove_file(dir.join("payload.txt")).unwrap();
+
+    names.iter().map(|n| dir.join(n)).collect()
+}
+
+/// Every offered op on every extra sample, outputs checked by reading them back.
+#[test]
+#[ignore = "slow: runs the converters"]
+fn qa_every_op_on_more_formats() {
+    let dir = tempfile::tempdir().unwrap();
+    let samples = more_samples(dir.path());
+    let failures = std::sync::Mutex::new(Vec::new());
+    let ran = std::sync::atomic::AtomicUsize::new(0);
+    // Four samples at a time; LibreOffice calls queue on their lock.
+    std::thread::scope(|s| {
+        for chunk in samples.chunks(samples.len().div_ceil(4)) {
+            let (failures, ran) = (&failures, &ran);
+            s.spawn(move || {
+                for file in chunk {
+                    let files = vec![file.clone()];
+                    for op in every_op(&files) {
+                        let name = format!("{} → {}", file.file_name().unwrap().to_string_lossy(), op.label());
+                        if let Err(why) = runnable(op, &files) {
+                            println!("skip {name}: {why}");
+                            continue;
+                        }
+                        ran.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        match within(180, {
+                            let files = files.clone();
+                            move || run(op, &files, params_for(op).as_ref(), None).map_err(|e| format!("{e:#}"))
+                        }) {
+                            None => failures.lock().unwrap().push(format!("{name}: timed out")),
+                            Some(Err(e)) => failures.lock().unwrap().push(format!("{name}: {e}")),
+                            Some(Ok(outs)) => match outs.iter().try_for_each(|o| looks_valid(o)) {
+                                Ok(()) => println!("ok   {name}"),
+                                Err(e) => failures.lock().unwrap().push(format!("{name}: {e}")),
+                            },
+                        }
+                    }
+                }
+            });
+        }
+    });
+    let failures = failures.into_inner().unwrap();
+    println!("{} ops ran, {} failed", ran.into_inner(), failures.len());
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// A two-frame TIFF converts its first frame only (one file, not `name-0`/`name-1`).
+#[test]
+#[ignore = "slow: runs the converters"]
+fn qa_multi_frame_images_give_one_still() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    sh(d, im(), &["-size", "8x8", "xc:red", "xc:blue", "multi.tiff"]);
+    let outs = run_checked(Op::Convert("png"), &[d.join("multi.tiff")], d, 60).unwrap();
+    assert_eq!(outs, vec![d.join("multi.png")]);
+}
+
+/// VTT → SRT keeps the cue text; SRT → VTT gets a header.
+#[test]
+#[ignore = "slow: runs the converters"]
+fn qa_subtitles_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(d.join("a.vtt"), "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\n").unwrap();
+    let srt = run_checked(Op::Convert("srt"), &[d.join("a.vtt")], d, 30).unwrap();
+    let text = std::fs::read_to_string(&srt[0]).unwrap();
+    assert!(text.contains("00:00:01,000 --> 00:00:02,000") && text.contains("Hello"), "{text}");
+    let vtt = run_checked(Op::Convert("vtt"), &srt, d, 30).unwrap();
+    assert!(std::fs::read_to_string(&vtt[0]).unwrap().starts_with("WEBVTT"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Hostile names
+// ---------------------------------------------------------------------------------------------
+
+/// Stems that every program must take literally.
+const HOSTILE: &[&str] = &[
+    "with space",
+    "çğıöşü İ",
+    "emoji 🍊",
+    "quote ' \" end",
+    "dollar $HOME",
+    "semi;colon && ls",
+    "-leading",
+    "br[0]",
+    "paren (2)",
+    "back\\slash",
+    "star*?",
+    "hash #1",
+    ".hidden",
+    "tab\there",
+    "newline\nhere",
+    "colon: a",
+];
+
+/// Stems with `%` sequences: ImageMagick, pdfseparate and ffmpeg's image writer read them as patterns.
+const PERCENT: &[&str] = &["pct%d", "pct %03d", "pct%s%x"];
+
+/// One sample of each kind under `stem`, and the ops that are tried on it.
+fn hostile_samples(dir: &Path, stem: &str, ext_case_upper: bool) -> Vec<(PathBuf, Vec<Op>)> {
+    let e = |ext: &str| if ext_case_upper { ext.to_uppercase() } else { ext.to_string() };
+    let mut out = Vec::new();
+    let mut put = |src: &Path, ext: &str, ops: Vec<Op>| {
+        let to = dir.join(format!("{stem}.{}", e(ext)));
+        std::fs::copy(src, &to).unwrap();
+        out.push((to, ops));
+    };
+    let base = dir.parent().unwrap().join("base");
+    put(
+        &base.join("s.png"),
+        "png",
+        vec![
+            Op::Convert("jpg"),
+            Op::Convert("pdf"),
+            Op::Tool(Tool::CompressImage),
+            Op::Tool(Tool::Resize),
+            Op::Tool(Tool::Zip),
+        ],
+    );
+    put(
+        &base.join("s.pdf"),
+        "pdf",
+        vec![
+            Op::Convert("png"),
+            Op::Convert("txt"),
+            Op::Tool(Tool::SplitPdf),
+            Op::Tool(Tool::CompressPdf),
+            Op::Tool(Tool::ExtractPages),
+            Op::Tool(Tool::RotatePdf),
+        ],
+    );
+    put(
+        &base.join("s.mp4"),
+        "mp4",
+        vec![Op::Convert("mp3"), Op::Tool(Tool::Thumbnail), Op::Tool(Tool::SplitMedia), Op::Tool(Tool::Trim)],
+    );
+    put(&base.join("s.md"), "md", vec![Op::Convert("html"), Op::Convert("docx")]);
+    put(&base.join("s.srt"), "srt", vec![Op::Convert("vtt"), Op::Convert("txt")]);
+    put(&base.join("s.zip"), "zip", vec![Op::Tool(Tool::Extract), Op::Convert("tar.gz")]);
+    put(&base.join("s.tar.gz"), "tar.gz", vec![Op::Tool(Tool::Extract), Op::Convert("zip")]);
+    if has_program("soffice") {
+        put(&base.join("s.docx"), "docx", vec![Op::Convert("pdf")]);
+    }
+    out
+}
+
+fn make_base(root: &Path) {
+    let base = root.join("base");
+    std::fs::create_dir_all(&base).unwrap();
+    sh(&base, im(), &["-size", "64x48", "gradient:orange-white", "s.png"]);
+    sh(&base, im(), &["s.png", "s.png", "s.pdf"]);
+    ff(
+        &base,
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=128x96:rate=25:duration=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=duration=1",
+            "-shortest",
+            "-pix_fmt",
+            "yuv420p",
+            "s.mp4",
+        ],
+    );
+    std::fs::write(base.join("s.md"), "# Title\n\nText.\n").unwrap();
+    std::fs::write(base.join("s.srt"), "1\n00:00:01,000 --> 00:00:02,000\nHello\n").unwrap();
+    sh(&base, "zip", &["-q", "s.zip", "s.md"]);
+    sh(&base, "tar", &["-czf", "s.tar.gz", "s.md"]);
+    sh(&base, "pandoc", &["s.md", "-o", "s.docx"]);
+}
+
+/// Runs every hostile sample of `stems` in its own folder; returns the failures.
+fn hostile_failures(stems: &[&str], upper: bool) -> Vec<String> {
+    let root = tempfile::tempdir().unwrap();
+    make_base(root.path());
+    let mut failures = Vec::new();
+    for (i, stem) in stems.iter().enumerate() {
+        let dir = root.path().join(format!("case{i}"));
+        std::fs::create_dir(&dir).unwrap();
+        for (file, ops) in hostile_samples(&dir, stem, upper) {
+            for op in ops {
+                let files = vec![file.clone()];
+                let name = format!("{:?} → {}", file.file_name().unwrap(), op.label());
+                if let Err(why) = runnable(op, &files) {
+                    println!("skip {name}: {why}");
+                    continue;
+                }
+                match run_checked(op, &files, &dir, 120) {
+                    Ok(_) => println!("ok   {name}"),
+                    Err(e) => failures.push(format!("{name}: {e}")),
+                }
+            }
+        }
+    }
+    failures
+}
+
+#[test]
+#[ignore = "slow: runs the converters"]
+fn qa_hostile_names_are_taken_literally() {
+    let failures = hostile_failures(HOSTILE, false);
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+#[test]
+#[ignore = "slow: runs the converters"]
+fn qa_upper_case_extensions_work() {
+    let failures = hostile_failures(&["UPPER"], true);
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+#[test]
+#[ignore = "BUG: ImageMagick, pdfseparate and ffmpeg's image writer expand % patterns in output names"]
+fn bug_percent_names_are_taken_literally() {
+    let failures = hostile_failures(PERCENT, false);
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// A stem of 250 bytes: outputs like `… (compressed).png` exceed NAME_MAX (255). That must be a
+/// clean error with nothing left behind, never a panic or a hang.
+#[test]
+#[ignore = "slow: runs the converters"]
+fn qa_very_long_names_fail_cleanly() {
+    let root = tempfile::tempdir().unwrap();
+    make_base(root.path());
+    let dir = root.path().join("long");
+    std::fs::create_dir(&dir).unwrap();
+    let stem = "é".repeat(123) + "abcd"; // 250 bytes
+    let mut bad = Vec::new();
+    for (file, ops) in hostile_samples(&dir, &stem, false) {
+        for op in ops {
+            let files = vec![file.clone()];
+            if runnable(op, &files).is_err() {
+                continue;
+            }
+            // Either it works (the output name fits) or it fails cleanly.
+            if let Err(e) = run_checked(op, &files, &dir, 120)
+                && let Err(why) = run_failing(op, &files, &dir, 120)
+            {
+                bad.push(format!("{} → {}: {e} / {why}", file.display().to_string().len(), op.label()));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "\n{}", bad.join("\n"));
+}
+
+#[test]
+#[ignore = "slow: runs the converters"]
+fn qa_dotfiles_and_files_without_extension() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(d.join(".bashrc"), "x\n").unwrap();
+    std::fs::write(d.join("README"), "x\n").unwrap();
+    for name in [".bashrc", "README"] {
+        let files = vec![d.join(name)];
+        assert!(options(Mode::Convert, &files).is_empty());
+        assert_eq!(options(Mode::Tools, &files), vec![Op::Tool(Tool::Zip)]);
+        let outs = run_checked(Op::Tool(Tool::Zip), &files, d, 30).unwrap();
+        assert_eq!(outs, vec![d.join(format!("{name}.zip"))]);
+    }
+}
+
+/// `name.gz` (one compressed file) and `name.tar.gz` (an archive) both extract.
+#[test]
+#[ignore = "slow: runs the converters"]
+fn qa_gz_and_tar_gz_extract_differently() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(d.join("notes.txt"), "hi\n").unwrap();
+    sh(d, "tar", &["-czf", "pack.tar.gz", "notes.txt"]);
+    sh(d, "gzip", &["-k", "notes.txt"]);
+    let outs = run_checked(Op::Tool(Tool::Extract), &[d.join("pack.tar.gz")], d, 30).unwrap();
+    assert!(outs[0].join("notes.txt").is_file());
+    let outs = run_checked(Op::Tool(Tool::Extract), &[d.join("notes.txt.gz")], d, 30).unwrap();
+    assert_eq!(std::fs::read_to_string(outs[0].join("notes.txt")).unwrap(), "hi\n");
+}
+
+/// Relative paths (a command line, or a future CLI) must work like absolute ones.
+#[test]
+#[ignore = "BUG: relative inputs break ops that run with a working folder (Zip, archive conversion)"]
+fn bug_relative_paths_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::create_dir(d.join("sub")).unwrap();
+    std::fs::write(d.join("sub/notes.md"), "# x\n").unwrap();
+    sh(&d.join("sub"), "zip", &["-q", "bundle.zip", "notes.md"]);
+    let mut failures = Vec::new();
+    for (file, op) in [
+        ("sub/notes.md", Op::Tool(Tool::Zip)),
+        ("sub/bundle.zip", Op::Convert("tar")),
+        ("sub/notes.md", Op::Convert("html")),
+    ] {
+        // Relative to the test process' working folder.
+        let rel = pathdiff(&d.join(file));
+        match run(op, std::slice::from_ref(&rel), None, None) {
+            Ok(outs) => {
+                if let Err(e) = outs.iter().try_for_each(|o| looks_valid(o)) {
+                    failures.push(format!("{file} → {}: {e}", op.label()));
+                }
+            }
+            Err(e) => failures.push(format!("{file} → {}: {e:#}", op.label())),
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// `to` as a path relative to the current working folder (`../../tmp/…`).
+fn pathdiff(to: &Path) -> PathBuf {
+    let cwd = std::env::current_dir().unwrap();
+    let ups = cwd.components().count() - 1;
+    let mut p = PathBuf::new();
+    for _ in 0..ups {
+        p.push("..");
+    }
+    p.join(to.strip_prefix("/").unwrap())
+}
+
+/// The file vanished between the drop and the run.
+#[test]
+#[ignore = "slow: runs the converters"]
+fn qa_a_deleted_input_fails_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let gone = [d.join("gone.png"), d.join("gone.pdf"), d.join("gone.mp4"), d.join("gone.docx"), d.join("gone.zip")];
+    let mut bad = Vec::new();
+    for f in &gone {
+        for op in every_op(std::slice::from_ref(f)) {
+            if runnable(op, std::slice::from_ref(f)).is_err() || matches!(op, Op::Tool(Tool::Zip)) {
+                continue;
+            }
+            match run_failing(op, std::slice::from_ref(f), d, 120) {
+                Ok(msg) => println!("ok   {} → {}: {msg}", f.display(), op.label()),
+                Err(e) => bad.push(format!("{} → {}: {e}", f.display(), op.label())),
+            }
+        }
+    }
+    assert!(bad.is_empty(), "\n{}", bad.join("\n"));
+}
+
+/// Results asked to go to a folder on another file system (`/dev/shm`): the LibreOffice path
+/// moves its result out of the scratch folder, which must fall back to a copy.
+#[test]
+#[ignore = "slow: runs the converters"]
+fn qa_results_on_another_file_system() {
+    let shm = Path::new("/dev/shm");
+    if !shm.is_dir() {
+        return;
+    }
+    let dest = tempfile::tempdir_in(shm).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(d.join("t.csv"), "a,b\n1,2\n").unwrap();
+    std::fs::write(d.join("n.md"), "# x\n").unwrap();
+    let mut cases = vec![(d.join("n.md"), Op::Convert("html"))];
+    if has_program("soffice") {
+        cases.push((d.join("t.csv"), Op::Convert("xlsx")));
+        cases.push((d.join("n.md"), Op::Convert("pdf")));
+    }
+    for (file, op) in cases {
+        let outs = run(op, std::slice::from_ref(&file), None, Some(dest.path())).unwrap();
+        assert!(outs.iter().all(|o| o.starts_with(dest.path())), "{outs:?}");
+        outs.iter().try_for_each(|o| looks_valid(o)).unwrap();
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Broken inputs
+// ---------------------------------------------------------------------------------------------
+
+/// Broken samples: (file name, how to make it). Every op on them must fail cleanly, in time.
+fn broken_samples(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    // Zero bytes, every kind.
+    for ext in [
+        "png", "jpg", "gif", "svg", "mp4", "mp3", "wav", "pdf", "zip", "tar.gz", "7z", "rar", "docx", "xlsx", "pptx",
+        "epub",
+    ] {
+        let f = dir.join(format!("zero_{}.{ext}", ext.replace('.', "_")));
+        std::fs::write(&f, b"").unwrap();
+        files.push(f);
+    }
+    // Truncated real files.
+    let good = dir.join("good");
+    std::fs::create_dir(&good).unwrap();
+    sh(&good, im(), &["-size", "640x480", "plasma:", "g.png"]);
+    sh(&good, im(), &["g.png", "g.png", "g.pdf"]);
+    ff(&good, &["-f", "lavfi", "-i", "testsrc=size=320x240:rate=25:duration=3", "-pix_fmt", "yuv420p", "g.mp4"]);
+    sh(&good, "zip", &["-q", "g.zip", "g.png", "g.pdf"]);
+    for (src, name) in [("g.png", "trunc.png"), ("g.pdf", "trunc.pdf"), ("g.mp4", "trunc.mp4"), ("g.zip", "trunc.zip")]
+    {
+        let bytes = std::fs::read(good.join(src)).unwrap();
+        let f = dir.join(name);
+        std::fs::write(&f, &bytes[..bytes.len() / 3]).unwrap();
+        files.push(f);
+    }
+    // Wrong content for the extension.
+    let f = dir.join("text.pdf");
+    std::fs::write(&f, "this is not a PDF\n").unwrap();
+    files.push(f);
+    let f = dir.join("text.mp4");
+    std::fs::write(&f, "this is not a video\n").unwrap();
+    files.push(f);
+    let f = dir.join("text.zip");
+    std::fs::write(&f, "this is not a zip\n").unwrap();
+    files.push(f);
+    std::fs::remove_dir_all(&good).unwrap();
+    files
+}
+
+/// Some ops cannot fail on garbage (Zip packs anything; subtitles to text read any text).
+fn always_works(op: Op) -> bool {
+    matches!(op, Op::Tool(Tool::Zip))
+}
+
+#[test]
+#[ignore = "slow: runs the converters"]
+fn qa_broken_inputs_fail_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let files = broken_samples(d);
+    let mut bad = Vec::new();
+    let mut lenient: HashMap<String, Vec<String>> = HashMap::new();
+    for f in &files {
+        let one = std::slice::from_ref(f);
+        for op in every_op(one) {
+            if always_works(op) || runnable(op, one).is_err() {
+                continue;
+            }
+            let name = format!("{} → {}", f.file_name().unwrap().to_string_lossy(), op.label());
+            match run_failing(op, one, d, 120) {
+                Ok(msg) => println!("ok   {name}: {msg}"),
+                // A converter that accepts an empty or cut file and writes a valid result is fine.
+                Err(e) if e.starts_with("succeeded") => {
+                    let outs = run_checked(op, one, d, 120);
+                    match outs {
+                        Ok(_) => lenient.entry(name).or_default().push("valid output".into()),
+                        Err(e2) => bad.push(format!("{name}: succeeded with a bad result: {e2}")),
+                    }
+                }
+                Err(e) => bad.push(format!("{name}: {e}")),
+            }
+        }
+    }
+    for (name, how) in &lenient {
+        println!("lenient {name}: {how:?}");
+    }
+    assert!(bad.is_empty(), "\n{}", bad.join("\n"));
+}
+
+/// A PNG named `.jpg` (or a JPEG named `.png`) converts: the programs sniff the content.
+#[test]
+#[ignore = "slow: runs the converters"]
+fn qa_wrong_extension_with_real_content_still_converts() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    sh(d, im(), &["-size", "16x16", "xc:red", "png:really-png.jpg"]);
+    let outs = run_checked(Op::Convert("webp"), &[d.join("really-png.jpg")], d, 60).unwrap();
+    assert_eq!(image_size(&outs[0]), Some((16, 16)));
+}
+
+fn encrypted_samples(dir: &Path) -> Vec<PathBuf> {
+    std::fs::write(dir.join("secret.txt"), "secret\n").unwrap();
+    let mut files = Vec::new();
+    sh(dir, "zip", &["-q", "-P", "pw", "locked.zip", "secret.txt"]);
+    files.push(dir.join("locked.zip"));
+    if has_program("7z") {
+        sh(dir, "7z", &["a", "-bd", "-ppw", "locked.7z", "secret.txt"]);
+        sh(dir, "7z", &["a", "-bd", "-ppw", "-mhe=on", "locked-names.7z", "secret.txt"]);
+        files.push(dir.join("locked.7z"));
+        files.push(dir.join("locked-names.7z"));
+    }
+    if has_program("rar") {
+        sh(dir, "rar", &["a", "-idq", "-ppw", "locked.rar", "secret.txt"]);
+        files.push(dir.join("locked.rar"));
+    }
+    if has_program("qpdf") {
+        sh(dir, im(), &["-size", "32x32", "xc:red", "plain.pdf"]);
+        sh(dir, "qpdf", &["--encrypt", "user", "owner", "256", "--", "plain.pdf", "locked.pdf"]);
+        std::fs::remove_file(dir.join("plain.pdf")).unwrap();
+        files.push(dir.join("locked.pdf"));
+    }
+    std::fs::remove_file(dir.join("secret.txt")).unwrap();
+    files
+}
+
+/// Password-protected inputs fail with an error and never wait for a password. Programs are
+/// started without a terminal (`setsid`), like the GUI is.
+#[test]
+#[ignore = "BUG: password-protected archives and PDFs hang or fail without saying why"]
+fn bug_password_protected_inputs_fail_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mut bad = Vec::new();
+    for f in encrypted_samples(d) {
+        let one = std::slice::from_ref(&f);
+        for op in every_op(one) {
+            if always_works(op) || runnable(op, one).is_err() {
+                continue;
+            }
+            let name = format!("{} → {}", f.file_name().unwrap().to_string_lossy(), op.label());
+            match run_failing(op, one, d, 60) {
+                Ok(msg) if msg.to_lowercase().contains("password") || msg.to_lowercase().contains("encrypt") => {
+                    println!("ok   {name}: {msg}")
+                }
+                Ok(msg) => bad.push(format!("{name}: fails without naming the password: {msg}")),
+                Err(e) => bad.push(format!("{name}: {e}")),
+            }
+        }
+    }
+    assert!(bad.is_empty(), "\n{}", bad.join("\n"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Concurrency
+// ---------------------------------------------------------------------------------------------
+
+/// Runs `n` copies of `op` on `file` at once; returns every output reported.
+fn race(op: Op, file: &Path, n: usize) -> Vec<PathBuf> {
+    let barrier = std::sync::Barrier::new(n);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                s.spawn(|| {
+                    barrier.wait();
+                    run(op, &[file.to_path_buf()], params_for(op).as_ref(), None).map_err(|e| format!("{e:#}"))
+                })
+            })
+            .collect();
+        handles.into_iter().flat_map(|h| h.join().unwrap().unwrap()).collect()
+    })
+}
+
+/// Eight conversions of one file to one format at the same time must give eight files.
+#[test]
+#[ignore = "BUG: Names::claim checks the disk at plan time, so concurrent runs claim the same output"]
+fn bug_concurrent_runs_never_share_an_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    sh(d, im(), &["-size", "400x300", "plasma:", "photo.png"]);
+    let outs = race(Op::Convert("jpg"), &d.join("photo.png"), 8);
+    let distinct: HashSet<&PathBuf> = outs.iter().collect();
+    let on_disk = std::fs::read_dir(d).unwrap().count() - 1;
+    assert_eq!((distinct.len(), on_disk), (8, 8), "outputs reported: {outs:?}");
+}
+
+/// Two LibreOffice conversions at once (different files) both succeed: `LO_LOCK` queues them.
+#[test]
+#[ignore = "slow: runs the converters"]
+fn qa_two_libreoffice_jobs_at_once() {
+    if !has_program("soffice") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::write(d.join("a.csv"), "a,b\n1,2\n").unwrap();
+    std::fs::write(d.join("b.tsv"), "a\tb\n1\t2\n").unwrap();
+    let (a, b) = (d.join("a.csv"), d.join("b.tsv"));
+    let (ra, rb) = std::thread::scope(|s| {
+        let ha = s.spawn(|| run(Op::Convert("xlsx"), std::slice::from_ref(&a), None, None));
+        let hb = s.spawn(|| run(Op::Convert("ods"), std::slice::from_ref(&b), None, None));
+        (ha.join().unwrap(), hb.join().unwrap())
+    });
+    for outs in [ra.unwrap(), rb.unwrap()] {
+        outs.iter().try_for_each(|o| looks_valid(o)).unwrap();
+    }
+}
+
+/// Different files in one folder, converted at once, each get their own output.
+#[test]
+#[ignore = "slow: runs the converters"]
+fn qa_concurrent_runs_on_different_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let files: Vec<PathBuf> = (0..8)
+        .map(|i| {
+            let f = d.join(format!("p{i}.png"));
+            sh(d, im(), &["-size", "64x48", "plasma:", &f.to_string_lossy()]);
+            f
+        })
+        .collect();
+    let outs: Vec<PathBuf> = std::thread::scope(|s| {
+        let hs: Vec<_> = files
+            .iter()
+            .map(|f| s.spawn(move || run(Op::Convert("jpg"), std::slice::from_ref(f), None, None)))
+            .collect();
+        hs.into_iter().flat_map(|h| h.join().unwrap().unwrap()).collect()
+    });
+    let distinct: HashSet<&PathBuf> = outs.iter().collect();
+    assert_eq!(distinct.len(), 8);
+    outs.iter().try_for_each(|o| looks_valid(o)).unwrap();
+}
+
+/// `facts` reads lengths, sizes and page counts, and gives nothing (not a panic) for junk.
+#[test]
+#[ignore = "slow: runs the converters"]
+fn qa_facts_on_real_and_broken_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    sh(d, im(), &["-size", "64x48", "xc:red", "a.png"]);
+    sh(d, im(), &["a.png", "a.png", "a.pdf"]);
+    std::fs::write(d.join("junk.pdf"), "junk").unwrap();
+    std::fs::write(d.join("junk.mp4"), "junk").unwrap();
+    assert_eq!(backend::facts(Tool::Resize, &[d.join("a.png")]).size, Some((64, 48)));
+    assert_eq!(backend::facts(Tool::ExtractPages, &[d.join("a.pdf")]).pages, Some(2));
+    assert_eq!(backend::facts(Tool::ExtractPages, &[d.join("a.pdf"), d.join("junk.pdf")]).pages, None);
+    assert_eq!(backend::facts(Tool::Trim, &[d.join("junk.mp4")]).duration, None);
+    assert!(media_duration(OsStr::new("/nonexistent-qa/x.mp4").as_ref()).is_none());
+}
