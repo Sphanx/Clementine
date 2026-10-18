@@ -1,0 +1,19 @@
+#!/bin/sh
+# Nautilus script: right-click > Scripts > Susen opens the Convert wheel on the selection.
+# Use this when the nautilus-python extension is not available.
+# Install: cp Susen ~/.local/share/nautilus/scripts/ && chmod +x ~/.local/share/nautilus/scripts/Susen
+# Override the command with SUSEN_COMMAND, e.g. "flatpak run io.github.sphanx.Susen".
+cmd=${SUSEN_COMMAND:-susen}
+if [ -n "$NAUTILUS_SCRIPT_SELECTED_FILE_PATHS" ]; then
+    # One absolute path per line; the variable is empty for remote locations.
+    # No globbing: a file named "*" must stay one file, not the whole folder.
+    set -f
+    old_ifs=$IFS
+    IFS='
+'
+    # shellcheck disable=SC2086
+    set -- $NAUTILUS_SCRIPT_SELECTED_FILE_PATHS
+    IFS=$old_ifs
+fi
+# shellcheck disable=SC2086
+exec $cmd --wheel -- "$@"

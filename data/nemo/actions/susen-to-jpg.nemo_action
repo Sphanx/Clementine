@@ -1,0 +1,8 @@
+[Nemo Action]
+Name=Convert to JPG (Susen)
+Comment=Convert the selected images to JPG
+Exec=susen --convert jpg --notify -- %F
+Icon-Name=io.github.sphanx.Susen
+Selection=notnone
+Mimetypes=image/*;
+Dependencies=susen;

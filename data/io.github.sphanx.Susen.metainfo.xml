@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>io.github.sphanx.Clementine</id>
-  <name>Clementine</name>
+  <id>io.github.sphanx.Susen</id>
+  <name>Susen</name>
   <summary>Offline drag-and-drop file converter</summary>
   <metadata_license>CC0-1.0</metadata_license>
   <!-- TODO: project_license. The owner has not picked a license yet.
@@ -11,7 +11,7 @@
   </developer>
   <description>
     <p>
-      Clementine converts files without uploading them anywhere. Drag a file onto the window,
+      Susen converts files without uploading them anywhere. Drag a file onto the window,
       hold a modifier key, and drop it on a format on the conversion wheel. The result lands
       next to the original as a new file; an input is never overwritten.
     </p>
@@ -27,9 +27,9 @@
       <li>Works on Wayland and X11; keyboard navigation for the shelf and the wheels</li>
     </ul>
   </description>
-  <launchable type="desktop-id">io.github.sphanx.Clementine.desktop</launchable>
-  <url type="homepage">https://github.com/Sphanx/clementine</url>
-  <url type="bugtracker">https://github.com/Sphanx/clementine/issues</url>
+  <launchable type="desktop-id">io.github.sphanx.Susen.desktop</launchable>
+  <url type="homepage">https://github.com/Sphanx/susen</url>
+  <url type="bugtracker">https://github.com/Sphanx/susen/issues</url>
   <categories>
     <category>Utility</category>
   </categories>

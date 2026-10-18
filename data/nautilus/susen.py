@@ -1,10 +1,10 @@
-# Clementine for GNOME Files (Nautilus) and Caja.
+# Susen for GNOME Files (Nautilus) and Caja.
 #
-# Adds a "Clementine" submenu to the right-click menu of local files:
-#   Open in Clementine wheel…   -> clementine --wheel FILES
-#   Convert to ▸ PNG, JPG, …    -> clementine --convert png --notify FILES
-#   Tools ▸ Compress, Zip, …    -> clementine --tool compress --notify FILES
-# The formats and tools are whatever `clementine --list FILES` reports, so the menu always
+# Adds a "Susen" submenu to the right-click menu of local files:
+#   Open in Susen wheel…   -> susen --wheel FILES
+#   Convert to ▸ PNG, JPG, …    -> susen --convert png --notify FILES
+#   Tools ▸ Compress, Zip, …    -> susen --tool compress --notify FILES
+# The formats and tools are whatever `susen --list FILES` reports, so the menu always
 # matches the wheel. Tools that need settings (Trim…, Resize…) are left to the wheel.
 #
 # Install (system): /usr/share/nautilus-python/extensions/  (needs python3-nautilus)
@@ -12,7 +12,7 @@
 # Install (user):   ~/.local/share/nautilus-python/extensions/
 # Then: nautilus -q   (or caja -q)
 #
-# Set CLEMENTINE_COMMAND to override the command, e.g. "flatpak run io.github.sphanx.Clementine".
+# Set SUSEN_COMMAND to override the command, e.g. "flatpak run io.github.sphanx.Susen".
 
 import os
 import shlex
@@ -45,17 +45,17 @@ else:
         gi.require_version("Nautilus", "3.0")
     from gi.repository import Nautilus as FM, GObject  # noqa: E402
 
-APP_ID = "io.github.sphanx.Clementine"
+APP_ID = "io.github.sphanx.Susen"
 LIST_TIMEOUT = 3  # seconds; the menu is built on the UI thread
 CACHE_SIZE = 32
 
 
 def find_command():
-    """The command that runs Clementine, as a list. Empty when it is not installed."""
-    custom = os.environ.get("CLEMENTINE_COMMAND")
+    """The command that runs Susen, as a list. Empty when it is not installed."""
+    custom = os.environ.get("SUSEN_COMMAND")
     if custom:
         return shlex.split(custom)
-    found = shutil.which("clementine")
+    found = shutil.which("susen")
     if found:
         return [found]
     if shutil.which("flatpak"):
@@ -74,7 +74,7 @@ def find_command():
 
 
 def parse_list(text):
-    """Turns `clementine --list` output into (id, label, needs_params, missing) tuples."""
+    """Turns `susen --list` output into (id, label, needs_params, missing) tuples."""
     options = []
     for line in text.splitlines():
         fields = line.split("\t")
@@ -98,7 +98,7 @@ def local_paths(files):
     return paths
 
 
-class ClementineMenu(GObject.GObject, FM.MenuProvider):
+class SusenMenu(GObject.GObject, FM.MenuProvider):
     def __init__(self):
         super().__init__()
         self.command = find_command()
@@ -135,7 +135,7 @@ class ClementineMenu(GObject.GObject, FM.MenuProvider):
         )
 
     def item(self, name, label, tip, args, paths, sensitive=True):
-        item = FM.MenuItem(name="Clementine::" + name, label=label, tip=tip)
+        item = FM.MenuItem(name="Susen::" + name, label=label, tip=tip)
         item.set_property("sensitive", sensitive)
         if sensitive:
             item.connect("activate", self.launch, args, paths)
@@ -150,11 +150,11 @@ class ClementineMenu(GObject.GObject, FM.MenuProvider):
         if not paths:
             return []
 
-        top = FM.MenuItem(name="Clementine::Menu", label="Clementine", tip="Convert with Clementine")
+        top = FM.MenuItem(name="Susen::Menu", label="Susen", tip="Convert with Susen")
         menu = FM.Menu()
         top.set_submenu(menu)
         menu.append_item(
-            self.item("Wheel", "Open in Clementine wheel…", "Choose from the conversion wheel", ["--wheel"], paths)
+            self.item("Wheel", "Open in Susen wheel…", "Choose from the conversion wheel", ["--wheel"], paths)
         )
 
         options = self.options_for(paths)
@@ -166,7 +166,7 @@ class ClementineMenu(GObject.GObject, FM.MenuProvider):
             entries = [o for o in options if o[0].startswith(prefix + ":") and not o[2]]
             if not entries:
                 continue
-            sub_item = FM.MenuItem(name="Clementine::" + name, label=title, tip="")
+            sub_item = FM.MenuItem(name="Susen::" + name, label=title, tip="")
             sub = FM.Menu()
             sub_item.set_submenu(sub)
             for oid, label, _needs, missing in entries:

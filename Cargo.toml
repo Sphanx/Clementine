@@ -1,5 +1,5 @@
 [package]
-name = "clementine"
+name = "susen"
 version = "0.1.0"
 edition = "2024"
 description = "Offline drag-and-drop file converter for Linux"
@@ -8,19 +8,20 @@ description = "Offline drag-and-drop file converter for Linux"
 [dependencies]
 anyhow = "1.0.104"
 gtk = { version = "0.11", package = "gtk4", features = ["v4_14"] }
+pangocairo = "0.22"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tempfile = "3.27.0"
 
 [package.metadata.deb]
-name = "clementine"
+name = "susen"
 maintainer = "Sphanx <98588426+Sphanx@users.noreply.github.com>"
 copyright = "2026, Sphanx"
 # TODO: license-file / license. The owner has not picked a license yet.
 section = "utils"
 priority = "optional"
 extended-description = """\
-Clementine converts files without uploading them anywhere. Drag a file onto the window, \
+Susen converts files without uploading them anywhere. Drag a file onto the window, \
 hold a modifier key, and drop it on a format on the conversion wheel. Conversions run \
 through ffmpeg, ImageMagick, pandoc, LibreOffice, poppler and the archive tools already \
 on your computer."""
@@ -28,17 +29,17 @@ depends = "$auto, libgtk-4-1 (>= 4.14)"
 recommends = "ffmpeg, imagemagick, pandoc, poppler-utils, zip, unzip"
 suggests = "libreoffice-core, unrar, p7zip-full, ghostscript, qpdf, python3-nautilus, libnotify-bin"
 assets = [
-    ["target/release/clementine", "usr/bin/", "755"],
-    ["data/io.github.sphanx.Clementine.desktop", "usr/share/applications/", "644"],
-    ["data/io.github.sphanx.Clementine.metainfo.xml", "usr/share/metainfo/", "644"],
-    ["data/icons/hicolor/scalable/apps/io.github.sphanx.Clementine.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
-    ["data/icons/hicolor/symbolic/apps/io.github.sphanx.Clementine-symbolic.svg", "usr/share/icons/hicolor/symbolic/apps/", "644"],
+    ["target/release/susen", "usr/bin/", "755"],
+    ["data/io.github.sphanx.Susen.desktop", "usr/share/applications/", "644"],
+    ["data/io.github.sphanx.Susen.metainfo.xml", "usr/share/metainfo/", "644"],
+    ["data/icons/hicolor/scalable/apps/io.github.sphanx.Susen.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["data/icons/hicolor/symbolic/apps/io.github.sphanx.Susen-symbolic.svg", "usr/share/icons/hicolor/symbolic/apps/", "644"],
     # File manager integration (README > File managers). Each is inert without its file manager.
-    ["data/nautilus/clementine.py", "usr/share/nautilus-python/extensions/", "644"],
-    ["data/nautilus/clementine.py", "usr/share/caja-python/extensions/", "644"],
+    ["data/nautilus/susen.py", "usr/share/nautilus-python/extensions/", "644"],
+    ["data/nautilus/susen.py", "usr/share/caja-python/extensions/", "644"],
     ["data/kio/servicemenus/*.desktop", "usr/share/kio/servicemenus/", "644"],
     ["data/nemo/actions/*.nemo_action", "usr/share/nemo/actions/", "644"],
     # Per-user only, so shipped for copying: Nautilus scripts and Thunar custom actions.
-    ["data/nautilus-scripts/Clementine", "usr/share/clementine/nautilus-scripts/", "755"],
-    ["data/thunar/uca.xml", "usr/share/clementine/thunar/", "644"],
+    ["data/nautilus-scripts/Susen", "usr/share/susen/nautilus-scripts/", "755"],
+    ["data/thunar/uca.xml", "usr/share/susen/thunar/", "644"],
 ]

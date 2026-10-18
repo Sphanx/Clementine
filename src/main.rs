@@ -1,4 +1,4 @@
-//! Clementine: drag a file in, tap a modifier, drop it on a format.
+//! Susen: drag a file in, tap a modifier, drop it on a format.
 //!
 //! Shift opens the conversion wheel, Ctrl the tools wheel, Alt the actions wheel.
 //! Wayland never tells a window about keys pressed while a drag from another app
@@ -11,6 +11,7 @@ mod backend;
 mod catalog;
 mod cli;
 mod config;
+mod messages;
 mod params;
 mod params_ui;
 mod settings_ui;
@@ -29,15 +30,15 @@ use gtk::{gdk, gio, glib};
 use catalog::{Mode, Op};
 use wheel::Wheel;
 
-const APP_ID: &str = "io.github.sphanx.Clementine";
+const APP_ID: &str = "io.github.sphanx.Susen";
 
 const CSS: &str = r#"
 .drop-hint { font-size: 1.4em; font-weight: bold; opacity: 0.8; }
 .chip { padding: 6px 14px; border-radius: 999px; background: alpha(currentColor, 0.08); font-weight: bold; }
-.chip.hot { background: #fe8019; color: white; }
+.chip.hot { background: #6b5b95; color: white; }
 .dim { opacity: 0.6; }
 .section { font-weight: bold; opacity: 0.7; margin: 8px 12px 2px 12px; }
-.error { color: #e01b24; }
+.error { color: @error_color; }
 "#;
 
 struct App {
@@ -75,7 +76,7 @@ fn main() -> glib::ExitCode {
     };
     let app = gtk::Application::builder().application_id(APP_ID).flags(gio::ApplicationFlags::HANDLES_OPEN).build();
     app.connect_activate(|app| window(app).present());
-    // `clementine file…` and "Open With" both land here; `--wheel` sends the hint "wheel".
+    // `susen file…` and "Open With" both land here; `--wheel` sends the hint "wheel".
     app.connect_open(|app, files, hint| {
         window(app).present();
         if let Some(state) = state() {
@@ -123,7 +124,7 @@ fn window(app: &gtk::Application) -> gtk::ApplicationWindow {
 fn build(app: &gtk::Application) -> Rc<App> {
     let window = gtk::ApplicationWindow::builder()
         .application(app)
-        .title("Clementine")
+        .title("Susen")
         .default_width(560)
         .default_height(620)
         .build();
@@ -183,9 +184,14 @@ fn build(app: &gtk::Application) -> Rc<App> {
     content.append(&jobs_scroll);
     content.append(&status);
 
-    // The wheel is painted over everything and never takes events itself.
-    let area = gtk::DrawingArea::new();
-    area.set_can_target(false);
+    // The wheel is painted over everything and never takes events itself; the overlay's
+    // gestures do. It takes keyboard focus while open so screen readers follow it (see wheel::sync).
+    let area = gtk::DrawingArea::builder()
+        .accessible_role(gtk::AccessibleRole::Menu)
+        .can_target(false)
+        .focusable(true)
+        .visible(false)
+        .build();
 
     let chips = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     chips.set_halign(gtk::Align::Center);
@@ -226,14 +232,13 @@ fn build(app: &gtk::Application) -> Rc<App> {
     let weak = Rc::downgrade(&state);
     state.area.set_draw_func(move |area, cr, _, _| {
         let Some(state) = weak.upgrade() else { return };
-        let fg = area.color();
-        let dark = fg.red() + fg.green() + fg.blue() > 1.5;
-        wheel::draw(cr, &state.wheel.borrow(), dark);
+        wheel::draw(area, cr, &state.wheel.borrow());
     });
 
     refresh_hints(&state);
     wire_drop(&state);
     wire_keys(&state);
+    wire_pointer(&state);
 
     let weak = Rc::downgrade(&state);
     gear.connect_clicked(move |_| {
@@ -314,14 +319,36 @@ fn chip_at(state: &App, x: f64, y: f64) -> Option<Mode> {
 }
 
 fn open_wheel(state: &App, mode: Mode, at: (f64, f64), files: Vec<PathBuf>, keyboard: bool) {
-    let center = wheel::clamp_center(at, state.overlay.width() as f64, state.overlay.height() as f64);
-    state.wheel.borrow_mut().show(mode, center, files, keyboard);
-    state.area.queue_draw();
+    let geo = wheel::geometry_for(&state.area);
+    let center = wheel::clamp_center(at, geo, state.overlay.width() as f64, state.overlay.height() as f64);
+    {
+        let mut w = state.wheel.borrow_mut();
+        w.geo = geo;
+        w.show(mode, center, files, keyboard);
+        if keyboard && w.return_focus.is_none() {
+            w.return_focus = gtk::prelude::GtkWindowExt::focus(&state.window);
+        }
+    }
+    redraw(state);
+    if keyboard {
+        state.area.grab_focus();
+    }
 }
 
 fn close_wheel(state: &App) {
+    let back = state.wheel.borrow_mut().return_focus.take();
     state.wheel.borrow_mut().hide();
-    state.area.queue_draw();
+    redraw(state);
+    // Back to the shelf row the wheel was opened from, with its focus ring showing.
+    if let Some(widget) = back {
+        widget.grab_focus();
+        state.window.set_focus_visible(true);
+    }
+}
+
+/// Repaints the wheel and tells assistive technology what changed.
+fn redraw(state: &App) {
+    wheel::sync(&state.area, &mut state.wheel.borrow_mut());
 }
 
 /// Called on every drag event over the window: opens, switches and aims the wheel.
@@ -353,7 +380,7 @@ fn track_drag(state: &App, target: &gtk::DropTarget, x: f64, y: f64) {
     wheel.set_files(files);
     wheel.hover_at(x, y);
     drop(wheel);
-    state.area.queue_draw();
+    redraw(state);
 }
 
 fn end_drag(state: &App) {
@@ -416,7 +443,7 @@ fn wire_keys(state: &Rc<App>) {
     let keys = gtk::EventControllerKey::new();
     keys.set_propagation_phase(gtk::PropagationPhase::Capture);
     let weak = Rc::downgrade(state);
-    keys.connect_key_pressed(move |_, key, _, _| {
+    keys.connect_key_pressed(move |_, key, _, mods| {
         let Some(state) = weak.upgrade() else { return glib::Propagation::Proceed };
         let (open, keyboard) = {
             let w = state.wheel.borrow();
@@ -428,7 +455,7 @@ fn wire_keys(state: &Rc<App>) {
         {
             if open {
                 state.wheel.borrow_mut().set_mode(mode);
-                state.area.queue_draw();
+                redraw(&state);
             } else {
                 open_wheel(&state, mode, state.pointer.get(), state.drag_files.borrow().clone(), false);
             }
@@ -437,6 +464,13 @@ fn wire_keys(state: &Rc<App>) {
         if !open {
             if key == gdk::Key::Delete {
                 remove_selected(&state);
+                return glib::Propagation::Stop;
+            }
+            // The context-menu key and Shift+F10 open the wheel, as they would a context menu.
+            let menu_key =
+                key == gdk::Key::Menu || (key == gdk::Key::F10 && mods.contains(gdk::ModifierType::SHIFT_MASK));
+            if menu_key && !selected_files(&state).is_empty() {
+                open_keyboard_wheel(&state);
                 return glib::Propagation::Stop;
             }
             return glib::Propagation::Proceed;
@@ -456,23 +490,136 @@ fn wire_keys(state: &Rc<App>) {
                 let next = w.mode.unwrap_or(Mode::Convert).next();
                 w.set_mode(next);
             }
+            gdk::Key::Home | gdk::Key::KP_Home => state.wheel.borrow_mut().select_edge(false),
+            gdk::Key::End | gdk::Key::KP_End => state.wheel.borrow_mut().select_edge(true),
             gdk::Key::Return | gdk::Key::KP_Enter | gdk::Key::space => {
-                let (op, files) = {
-                    let w = state.wheel.borrow();
-                    (w.chosen(), w.files.clone())
-                };
-                close_wheel(&state);
-                if let Some(op) = op {
-                    execute(&state, op, files);
-                }
+                run_chosen(&state);
                 return glib::Propagation::Stop;
             }
-            _ => return glib::Propagation::Stop,
+            // 1–9 run slice N; a greyed-out one is only selected, so its reason is read out.
+            other => {
+                let Some(i) = other.to_unicode().and_then(wheel::digit_slice) else { return glib::Propagation::Stop };
+                let runs = {
+                    let mut w = state.wheel.borrow_mut();
+                    w.select(i) && w.chosen().is_some()
+                };
+                if runs {
+                    run_chosen(&state);
+                    return glib::Propagation::Stop;
+                }
+            }
         }
-        state.area.queue_draw();
+        redraw(&state);
         glib::Propagation::Stop
     });
     state.window.add_controller(keys);
+}
+
+/// Closes the wheel and runs its selected slice, if that can run.
+fn run_chosen(state: &Rc<App>) {
+    let (op, files) = {
+        let w = state.wheel.borrow();
+        (w.chosen(), w.files.clone())
+    };
+    close_wheel(state);
+    if let Some(op) = op {
+        execute(state, op, files);
+    }
+}
+
+/// Pointer users without modifier keys: right-click (or long-press on a touch screen) a shelf
+/// row to open the wheel there, then click a slice to run it, or anywhere else to cancel.
+fn wire_pointer(state: &Rc<App>) {
+    let secondary = gtk::GestureClick::builder().button(gdk::BUTTON_SECONDARY).build();
+    let weak = Rc::downgrade(state);
+    secondary.connect_pressed(move |g, _, x, y| {
+        if let Some(state) = weak.upgrade()
+            && open_from_shelf(&state, x, y)
+        {
+            g.set_state(gtk::EventSequenceState::Claimed);
+        }
+    });
+    state.shelf.add_controller(secondary);
+
+    let long = gtk::GestureLongPress::new();
+    long.set_touch_only(true);
+    let weak = Rc::downgrade(state);
+    long.connect_pressed(move |g, x, y| {
+        if let Some(state) = weak.upgrade()
+            && open_from_shelf(&state, x, y)
+        {
+            g.set_state(gtk::EventSequenceState::Claimed);
+        }
+    });
+    state.shelf.add_controller(long);
+
+    // While a wheel opened this way is up, it gets every click before the widgets below it.
+    let click = gtk::GestureClick::builder().button(0).propagation_phase(gtk::PropagationPhase::Capture).build();
+    let weak = Rc::downgrade(state);
+    click.connect_pressed(move |g, _, x, y| {
+        let Some(state) = weak.upgrade() else { return };
+        if !state.wheel.borrow().open || state.dragging.get() {
+            return;
+        }
+        g.set_state(gtk::EventSequenceState::Claimed);
+        let (hit, runs) = {
+            let mut w = state.wheel.borrow_mut();
+            let hit = wheel::slice_at(w.slices.len(), w.geo, w.center, (x, y));
+            if let Some(i) = hit {
+                w.select(i);
+            }
+            (hit, w.chosen().is_some())
+        };
+        match (hit, runs) {
+            (Some(_), true) => run_chosen(&state),
+            // A greyed-out slice: stay open and say why.
+            (Some(_), false) => redraw(&state),
+            (None, _) => close_wheel(&state),
+        }
+    });
+    state.overlay.add_controller(click);
+
+    let motion = gtk::EventControllerMotion::new();
+    let weak = Rc::downgrade(state);
+    motion.connect_motion(move |_, x, y| {
+        let Some(state) = weak.upgrade() else { return };
+        if state.dragging.get() {
+            return;
+        }
+        let changed = {
+            let mut w = state.wheel.borrow_mut();
+            let hit = wheel::slice_at(w.slices.len(), w.geo, w.center, (x, y));
+            let changed = w.open && w.keyboard && hit.is_some() && hit != w.hovered;
+            if changed {
+                w.hovered = hit;
+            }
+            changed
+        };
+        if changed {
+            redraw(&state);
+        }
+    });
+    state.overlay.add_controller(motion);
+}
+
+/// Opens the Convert wheel at a pointer position on the shelf, for the row under it.
+fn open_from_shelf(state: &App, x: f64, y: f64) -> bool {
+    let Some(row) = state.shelf.row_at_y(y as i32) else { return false };
+    if !row.is_selected() {
+        state.shelf.unselect_all();
+        state.shelf.select_row(Some(&row));
+    }
+    let files = selected_files(state);
+    if files.is_empty() {
+        return false;
+    }
+    row.grab_focus();
+    let at = state
+        .shelf
+        .compute_point(&state.overlay, &gtk::graphene::Point::new(x as f32, y as f32))
+        .map_or((x, y), |p| (p.x() as f64, p.y() as f64));
+    open_wheel(state, Mode::Convert, at, files, true);
+    true
 }
 
 fn selected_files(state: &App) -> Vec<PathBuf> {
@@ -567,6 +714,7 @@ fn shelf_row(file: &Path) -> gtk::ListBoxRow {
     line.append(&text);
     let row = gtk::ListBoxRow::new();
     row.set_child(Some(&line));
+    row.update_property(&[gtk::accessible::Property::Label(&file.file_name().unwrap_or_default().to_string_lossy())]);
 
     // Shelf rows drag out to file managers, or back onto the window to open a wheel.
     let source = gtk::DragSource::new();
@@ -659,7 +807,7 @@ fn start_job(state: &Rc<App>, op: Op, files: Vec<PathBuf>, params: Option<params
                 err.add_css_class("error");
                 err.set_tooltip_text(Some(&format!("{e:#}")));
                 line.append(&err);
-                state.status.set_text(&format!("{e:#}"));
+                state.status.set_text(&messages::headline(&format!("{e:#}")));
             }
             Err(_) => state.status.set_text("The converter crashed"),
         }

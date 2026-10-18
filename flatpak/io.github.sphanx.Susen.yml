@@ -1,9 +1,9 @@
-# Flatpak manifest for Clementine.
+# Flatpak manifest for Susen.
 #
 # Build (from the repo root):
 #   flatpak install --user flathub org.gnome.Platform//51 org.gnome.Sdk//51 \
 #       org.freedesktop.Sdk.Extension.rust-stable//26.08
-#   flatpak-builder --user --install --force-clean build-dir flatpak/io.github.sphanx.Clementine.yml
+#   flatpak-builder --user --install --force-clean build-dir flatpak/io.github.sphanx.Susen.yml
 #
 # Regenerate cargo-sources.json whenever Cargo.lock changes:
 #   pip install flatpak-cargo-generator
@@ -18,18 +18,18 @@
 #
 # File manager menus (data/nautilus, data/kio, data/nemo, data/thunar) cannot be installed by a
 # Flatpak: they live in the host's file manager. Users copy them by hand and run the app as
-# `flatpak run io.github.sphanx.Clementine --convert png FILE…`; see README.md > File managers.
+# `flatpak run io.github.sphanx.Susen --convert png FILE…`; see README.md > File managers.
 #
 # Status: this manifest has been checked for YAML validity and its source URLs and hashes were
 # fetched. It has NOT been run through flatpak-builder end to end; treat a first build as the test.
 
-id: io.github.sphanx.Clementine
+id: io.github.sphanx.Susen
 runtime: org.gnome.Platform
 runtime-version: '51'
 sdk: org.gnome.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
-command: clementine
+command: susen
 finish-args:
   # Files are read and written next to their inputs, so the whole home directory is needed.
   - --filesystem=home
@@ -43,7 +43,7 @@ finish-args:
 build-options:
   append-path: /usr/lib/sdk/rust-stable/bin
   env:
-    CARGO_HOME: /run/build/clementine/cargo
+    CARGO_HOME: /run/build/susen/cargo
 
 modules:
   # ---- Bundled converters --------------------------------------------------
@@ -134,21 +134,21 @@ modules:
         url: https://poppler.freedesktop.org/poppler-26.10.0.tar.xz
         sha256: 6792cb7c69205007ad87d2e936cecc5b3a31fac29ab54ffc3175fdb6b2a6ce35
 
-  # ---- Clementine -------------------------------------------------------------
+  # ---- Susen -------------------------------------------------------------
 
-  - name: clementine
+  - name: susen
     buildsystem: simple
     build-options:
       env:
-        CARGO_HOME: /run/build/clementine/cargo
+        CARGO_HOME: /run/build/susen/cargo
     build-commands:
       - cargo --offline fetch --manifest-path Cargo.toml --verbose
       - cargo --offline build --release --verbose
-      - install -Dm755 target/release/clementine -t /app/bin/
-      - install -Dm644 data/io.github.sphanx.Clementine.desktop -t /app/share/applications/
-      - install -Dm644 data/io.github.sphanx.Clementine.metainfo.xml -t /app/share/metainfo/
-      - install -Dm644 data/icons/hicolor/scalable/apps/io.github.sphanx.Clementine.svg -t /app/share/icons/hicolor/scalable/apps/
-      - install -Dm644 data/icons/hicolor/symbolic/apps/io.github.sphanx.Clementine-symbolic.svg -t /app/share/icons/hicolor/symbolic/apps/
+      - install -Dm755 target/release/susen -t /app/bin/
+      - install -Dm644 data/io.github.sphanx.Susen.desktop -t /app/share/applications/
+      - install -Dm644 data/io.github.sphanx.Susen.metainfo.xml -t /app/share/metainfo/
+      - install -Dm644 data/icons/hicolor/scalable/apps/io.github.sphanx.Susen.svg -t /app/share/icons/hicolor/scalable/apps/
+      - install -Dm644 data/icons/hicolor/symbolic/apps/io.github.sphanx.Susen-symbolic.svg -t /app/share/icons/hicolor/symbolic/apps/
     sources:
       - type: dir
         path: ..

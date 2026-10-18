@@ -39,10 +39,10 @@ jobs:
         run: |
           deb=$(ls target/debian/*.deb)
           dpkg-deb -I "$deb"
-          dpkg-deb -c "$deb" | grep -E 'usr/bin/clementine|\.desktop|metainfo|\.svg'
+          dpkg-deb -c "$deb" | grep -E 'usr/bin/susen|\.desktop|metainfo|\.svg'
       - uses: actions/upload-artifact@v4
         with:
-          name: clementine-deb
+          name: susen-deb
           path: target/debian/*.deb
           retention-days: 30
           if-no-files-found: error
