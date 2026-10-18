@@ -25,5 +25,7 @@ xdotool key Return; sleep 4; shot 07-ran
 ls "$WORK"
 xdotool mousemove $((X + 100)) $((Y + 90)) click 1; sleep 0.3
 xdotool key Delete; sleep 0.5; shot 08-deleted
+xdotool mousemove $((X + 405)) $((Y + 27)) click 1; sleep 1.5; shot 09-settings
+xdotool search --pid $APP | while read w; do xdotool getwindowname "$w"; done | sort -u
 echo "--- app log"; cat "$WORK/log"
 kill $APP
