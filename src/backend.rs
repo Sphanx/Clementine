@@ -99,11 +99,28 @@ impl Names {
 /// File name without the extension that [`extension`] reports (`a.tar.gz` gives `a`).
 pub fn stem(path: &Path) -> String {
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let ext = extension(path);
-    if ext.is_empty() || path.is_dir() {
+    if path.is_dir() {
         return name;
     }
-    name[..name.len() - ext.len() - 1].to_string()
+    // Cut by the extension as written: lower-casing can change its length (`İ` → `i̇`).
+    match extension(path).as_str() {
+        "" => name,
+        "tar.gz" => name[..name.len() - ".tar.gz".len()].to_string(),
+        _ => path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or(name),
+    }
+}
+
+/// `%` doubled, for programs that read printf-style patterns in a file name.
+fn escape_percent(s: &OsStr) -> OsString {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let mut out = Vec::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        out.push(b);
+        if b == b'%' {
+            out.push(b'%');
+        }
+    }
+    OsString::from_vec(out)
 }
 
 fn parent(path: &Path) -> PathBuf {
@@ -757,8 +774,9 @@ fn tool_job(input: &Path, tool: Tool, setup: &Setup, names: &mut Names) -> Resul
         Tool::CompressPdf => {
             let out = names.claim(&dir, &format!("{name} (compressed)"), "pdf");
             let args = ["-sDEVICE=pdfwrite", "-dPDFSETTINGS=/ebook", "-dNOPAUSE", "-dBATCH", "-dQUIET"];
+            // Ghostscript reads `%d` in the output name as a page number; `%%` is a literal `%`.
             let mut o = OsString::from("-sOutputFile=");
-            o.push(&out);
+            o.push(escape_percent(out.as_os_str()));
             steps.push(Step::Run(Cmd::new("gs").args(args).arg(o).arg(input)));
             out
         }
@@ -812,7 +830,8 @@ pub fn plan_in(
             let out = names.claim(&dir, &base, "zip");
             // Same folder: store bare names. Mixed folders: store full paths.
             let same = files.iter().all(|f| parent(f) == dir);
-            let mut cmd = Cmd::new("zip").args(["-r", "-q"]).arg(&out);
+            // `--`: a bare name such as `-v.png` is a file, not an option.
+            let mut cmd = Cmd::new("zip").args(["-r", "-q"]).arg(&out).arg("--");
             for f in files {
                 cmd = cmd.arg(if same { f.file_name().unwrap().to_owned() } else { f.as_os_str().to_owned() });
             }

@@ -573,8 +573,20 @@ const HELP: &str = "Arrow keys or 1 to 9 choose, Enter runs, Tab switches wheel,
 
 /// GTK 4.14 crashes (calls a null function) when announcing through any accessibility
 /// backend but AT-SPI, e.g. with `NO_AT_BRIDGE=1` or `GTK_A11Y=none`, so only AT-SPI is asked.
+///
+/// With `GTK_A11Y=none` a widget has no AT context at all, and gtk-rs' `at_context()` panics on
+/// the null pointer (an abort, inside a GTK callback), so the context is fetched by hand.
 fn can_announce(area: &gtk::DrawingArea) -> bool {
-    area.at_context().type_().name() == "GtkAtSpiContext"
+    use gtk::glib::translate::{ToGlibPtr, from_glib_full};
+    let accessible = area.upcast_ref::<gtk::Accessible>();
+    // SAFETY: a valid GtkAccessible; the result is a new reference or null.
+    let ptr = unsafe { gtk::ffi::gtk_accessible_get_at_context(accessible.to_glib_none().0) };
+    if ptr.is_null() {
+        return false;
+    }
+    // SAFETY: non-null and owned (transfer full).
+    let context: gtk::ATContext = unsafe { from_glib_full(ptr) };
+    context.type_().name() == "GtkAtSpiContext"
 }
 
 /// Shows or hides the wheel's area, keeps its accessible name and description current, and
