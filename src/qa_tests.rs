@@ -298,7 +298,9 @@ fn looks_valid(out: &Path) -> Result<(), String> {
         return Err(format!("{} is empty", out.display()));
     }
     let ok = match kind_of(out) {
-        Kind::Image => image_size(out).is_some(),
+        // `image_size` hands the name to ImageMagick, which reads `%d` in it as a pattern
+        // (see `bug_percent_names_are_taken_literally`); the bytes on stdin are checked instead.
+        Kind::Image => image_size(out).is_some() || image_on_stdin(out),
         Kind::Audio | Kind::Video => media_duration(out).is_some(),
         Kind::Pdf => pdf_page_count(out).is_some_and(|n| n > 0),
         Kind::Archive if extension(out) == "zip" => sh_in(Path::new("/"), "unzip", &["-tqq", &out.to_string_lossy()]),
@@ -306,6 +308,17 @@ fn looks_valid(out: &Path) -> Result<(), String> {
         _ => true,
     };
     if ok { Ok(()) } else { Err(format!("{} does not read back as {}", out.display(), extension(out))) }
+}
+
+fn image_on_stdin(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else { return false };
+    Command::new(im())
+        .args(["-[0]", "-format", "%w", "info:"])
+        .stdin(file)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|o| o.status.success() && !o.stdout.is_empty())
 }
 
 /// Everything under `dir`, recursively, as relative paths.
@@ -327,6 +340,7 @@ fn listing(dir: &Path) -> HashSet<PathBuf> {
 /// Runs `op` on `files` with a timeout and checks the result: outputs valid, and nothing
 /// appeared in `dir` that is not one of them (or inside one of them).
 fn run_checked(op: Op, files: &[PathBuf], dir: &Path, secs: u64) -> Result<Vec<PathBuf>, String> {
+    isolate_libreoffice();
     let before = listing(dir);
     let params = params_for(op);
     let f = files.to_vec();
@@ -348,6 +362,23 @@ fn run_checked(op: Op, files: &[PathBuf], dir: &Path, secs: u64) -> Result<Vec<P
 
 /// Like [`run_checked`] for an input that must fail: an error, in time, with nothing left behind.
 fn run_failing(op: Op, files: &[PathBuf], dir: &Path, secs: u64) -> Result<String, String> {
+    match run_any(op, files, dir, secs)? {
+        Outcome::Failed(e) => Ok(e),
+        Outcome::Worked(outs) => Err(format!("succeeded: {outs:?}")),
+    }
+}
+
+enum Outcome {
+    /// Failed cleanly, with this message.
+    Failed(String),
+    /// Worked, and its outputs read back.
+    Worked(Vec<PathBuf>),
+}
+
+/// Runs once, in time, without a panic: a clean failure (nothing left behind, a message) or a
+/// success whose outputs read back and that left nothing else behind. Anything else is `Err`.
+fn run_any(op: Op, files: &[PathBuf], dir: &Path, secs: u64) -> Result<Outcome, String> {
+    isolate_libreoffice();
     let before = listing(dir);
     let params = params_for(op);
     let f = files.to_vec();
@@ -356,14 +387,36 @@ fn run_failing(op: Op, files: &[PathBuf], dir: &Path, secs: u64) -> Result<Strin
     })
     .ok_or_else(|| format!("timed out after {secs} s"))?
     .map_err(|_| "panicked".to_string())?;
-    let after = listing(dir);
-    let left: Vec<_> = after.difference(&before).collect();
+    let new: Vec<PathBuf> = listing(dir).difference(&before).cloned().collect();
     match result {
-        Ok(outs) => Err(format!("succeeded: {outs:?}")),
-        Err(_) if !left.is_empty() => Err(format!("failed but left {left:?}")),
+        Err(_) if !new.is_empty() => Err(format!("failed but left {new:?}")),
         Err(e) if e.trim().is_empty() => Err("failed with an empty message".into()),
-        Err(e) => Ok(e),
+        Err(e) => Ok(Outcome::Failed(e)),
+        Ok(outs) => {
+            outs.iter().try_for_each(|o| looks_valid(o)).map_err(|e| format!("succeeded with a bad result: {e}"))?;
+            let stray: Vec<_> = new.iter().filter(|p| !outs.iter().any(|o| dir.join(p).starts_with(o))).collect();
+            if stray.is_empty() {
+                Ok(Outcome::Worked(outs))
+            } else {
+                Err(format!("left files it did not report: {stray:?} (reported {outs:?})"))
+            }
+        }
     }
+}
+
+/// Other Clementine processes (a second checkout, the GUI, the file manager menus) share the
+/// LibreOffice profile in `~/.cache/clementine`, and LibreOffice fails silently when two
+/// processes use one profile (see `bug_two_processes_convert_with_libreoffice_at_once`). The
+/// tests here get a cache folder of their own.
+fn isolate_libreoffice() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let cache = std::env::temp_dir().join(format!("clementine-qa-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&cache).unwrap();
+        // SAFETY: set once, before any test of this module starts a converter thread; other
+        // threads only read the variable.
+        unsafe { std::env::set_var("XDG_CACHE_HOME", cache) };
+    });
 }
 
 fn every_op(files: &[PathBuf]) -> Vec<Op> {
@@ -437,7 +490,20 @@ fn lo(dir: &Path, from: &str, ext: &str, to: &str) -> bool {
     let ok = sh_in(
         dir,
         "soffice",
-        &["--headless", "--norestore", "--convert-to", ext, "--outdir", &tmp.to_string_lossy(), from],
+        &[
+            &format!(
+                "-env:UserInstallation=file://{}/clementine-qa-lo-{}",
+                std::env::temp_dir().display(),
+                std::process::id()
+            ),
+            "--headless",
+            "--norestore",
+            "--convert-to",
+            ext,
+            "--outdir",
+            &tmp.to_string_lossy(),
+            from,
+        ],
     );
     let made = std::fs::read_dir(&tmp).unwrap().flatten().next().map(|e| e.path());
     let ok = ok && made.is_some_and(|m| std::fs::rename(m, dir.join(to)).is_ok());
@@ -448,6 +514,7 @@ fn lo(dir: &Path, from: &str, ext: &str, to: &str) -> bool {
 /// Samples of the formats the stock real test does not cover. Each has its own stem, so no two
 /// samples ever compete for an output name.
 fn more_samples(dir: &Path) -> Vec<PathBuf> {
+    isolate_libreoffice();
     let mut names: Vec<String> = Vec::new();
     let mut add = |n: &str| names.push(n.to_string());
     let lavfi = |s: &str| ["-f", "lavfi", "-i", s].map(String::from);
@@ -584,6 +651,20 @@ fn more_samples(dir: &Path) -> Vec<PathBuf> {
     names.iter().map(|n| dir.join(n)).collect()
 }
 
+/// Ops on [`more_samples`] that fail for a known, open bug, and the `bug_` test that reproduces it.
+fn known_bug(file: &Path, op: Op) -> Option<&'static str> {
+    let name = file.file_name()?.to_str()?;
+    match (name, op) {
+        ("i_multi.tiff", Op::Tool(Tool::Resize)) => Some("bug_resize_on_animations_and_multi_page_images"),
+        ("a_wma.wma", Op::Tool(Tool::NormalizeAudio)) => Some("bug_normalize_wma"),
+        ("v_avi.avi" | "v_wmv.wmv" | "v_mpg.mpg" | "v_flv.flv", Op::Tool(Tool::Speed)) => {
+            Some("bug_speed_on_avi_wmv_mpg_flv")
+        }
+        ("v_mpg.mpg", Op::Convert("mkv")) => Some("bug_mpg_to_mkv"),
+        _ => None,
+    }
+}
+
 /// Every offered op on every extra sample, outputs checked by reading them back.
 #[test]
 #[ignore = "slow: runs the converters"]
@@ -603,6 +684,10 @@ fn qa_every_op_on_more_formats() {
                         let name = format!("{} → {}", file.file_name().unwrap().to_string_lossy(), op.label());
                         if let Err(why) = runnable(op, &files) {
                             println!("skip {name}: {why}");
+                            continue;
+                        }
+                        if let Some(bug) = known_bug(file, op) {
+                            println!("skip {name}: known bug, see {bug}");
                             continue;
                         }
                         ran.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -812,7 +897,7 @@ fn qa_very_long_names_fail_cleanly() {
     make_base(root.path());
     let dir = root.path().join("long");
     std::fs::create_dir(&dir).unwrap();
-    let stem = "é".repeat(123) + "abcd"; // 250 bytes
+    let stem = "é".repeat(118) + "abcd"; // 240 bytes: inputs fit, `… (compressed).pdf` does not
     let mut bad = Vec::new();
     for (file, ops) in hostile_samples(&dir, &stem, false) {
         for op in ops {
@@ -821,10 +906,10 @@ fn qa_very_long_names_fail_cleanly() {
                 continue;
             }
             // Either it works (the output name fits) or it fails cleanly.
-            if let Err(e) = run_checked(op, &files, &dir, 120)
-                && let Err(why) = run_failing(op, &files, &dir, 120)
-            {
-                bad.push(format!("{} → {}: {e} / {why}", file.display().to_string().len(), op.label()));
+            match run_any(op, &files, &dir, 120) {
+                Ok(Outcome::Failed(e)) => println!("ok   long → {}: {e}", op.label()),
+                Ok(Outcome::Worked(_)) => println!("ok   long → {}", op.label()),
+                Err(e) => bad.push(format!("long.{} → {}: {e}", extension(&file), op.label())),
             }
         }
     }
@@ -868,14 +953,16 @@ fn qa_gz_and_tar_gz_extract_differently() {
 fn bug_relative_paths_work() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
-    std::fs::create_dir(d.join("sub")).unwrap();
-    std::fs::write(d.join("sub/notes.md"), "# x\n").unwrap();
-    sh(&d.join("sub"), "zip", &["-q", "bundle.zip", "notes.md"]);
+    // Deep enough that `..`s meant for the test's working folder cannot land back in place.
+    let sub = d.join("sub/deeper/deepest/still");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(sub.join("notes.md"), "# x\n").unwrap();
+    sh(&sub, "zip", &["-q", "bundle.zip", "notes.md"]);
     let mut failures = Vec::new();
     for (file, op) in [
-        ("sub/notes.md", Op::Tool(Tool::Zip)),
-        ("sub/bundle.zip", Op::Convert("tar")),
-        ("sub/notes.md", Op::Convert("html")),
+        ("sub/deeper/deepest/still/notes.md", Op::Tool(Tool::Zip)),
+        ("sub/deeper/deepest/still/bundle.zip", Op::Convert("tar")),
+        ("sub/deeper/deepest/still/notes.md", Op::Convert("html")),
     ] {
         // Relative to the test process' working folder.
         let rel = pathdiff(&d.join(file));
@@ -929,6 +1016,7 @@ fn qa_a_deleted_input_fails_cleanly() {
 #[test]
 #[ignore = "slow: runs the converters"]
 fn qa_results_on_another_file_system() {
+    isolate_libreoffice();
     let shm = Path::new("/dev/shm");
     if !shm.is_dir() {
         return;
@@ -1014,16 +1102,10 @@ fn qa_broken_inputs_fail_cleanly() {
                 continue;
             }
             let name = format!("{} → {}", f.file_name().unwrap().to_string_lossy(), op.label());
-            match run_failing(op, one, d, 120) {
-                Ok(msg) => println!("ok   {name}: {msg}"),
+            match run_any(op, one, d, 120) {
+                Ok(Outcome::Failed(msg)) => println!("ok   {name}: {msg}"),
                 // A converter that accepts an empty or cut file and writes a valid result is fine.
-                Err(e) if e.starts_with("succeeded") => {
-                    let outs = run_checked(op, one, d, 120);
-                    match outs {
-                        Ok(_) => lenient.entry(name).or_default().push("valid output".into()),
-                        Err(e2) => bad.push(format!("{name}: succeeded with a bad result: {e2}")),
-                    }
-                }
+                Ok(Outcome::Worked(outs)) => lenient.entry(name).or_default().push(format!("{outs:?}")),
                 Err(e) => bad.push(format!("{name}: {e}")),
             }
         }
@@ -1103,6 +1185,7 @@ fn bug_password_protected_inputs_fail_cleanly() {
 
 /// Runs `n` copies of `op` on `file` at once; returns every output reported.
 fn race(op: Op, file: &Path, n: usize) -> Vec<PathBuf> {
+    isolate_libreoffice();
     let barrier = std::sync::Barrier::new(n);
     std::thread::scope(|s| {
         let handles: Vec<_> = (0..n)
@@ -1134,6 +1217,7 @@ fn bug_concurrent_runs_never_share_an_output() {
 #[test]
 #[ignore = "slow: runs the converters"]
 fn qa_two_libreoffice_jobs_at_once() {
+    isolate_libreoffice();
     if !has_program("soffice") {
         return;
     }
@@ -1192,4 +1276,300 @@ fn qa_facts_on_real_and_broken_files() {
     assert_eq!(backend::facts(Tool::ExtractPages, &[d.join("a.pdf"), d.join("junk.pdf")]).pages, None);
     assert_eq!(backend::facts(Tool::Trim, &[d.join("junk.mp4")]).duration, None);
     assert!(media_duration(OsStr::new("/nonexistent-qa/x.mp4").as_ref()).is_none());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Open bugs found on real files
+// ---------------------------------------------------------------------------------------------
+
+/// Makes `name` in `dir` with ffmpeg from a 1-second test pattern (and tone) and these codecs.
+fn ff_sample(dir: &Path, name: &str, codecs: &[&str]) -> PathBuf {
+    let mut args = vec!["-f", "lavfi", "-i", "testsrc=size=128x96:rate=25:duration=1", "-f", "lavfi", "-i"];
+    args.extend_from_slice(&["sine=duration=1", "-shortest", "-pix_fmt", "yuv420p"]);
+    args.extend_from_slice(codecs);
+    args.push(name);
+    ff(dir, &args);
+    dir.join(name)
+}
+
+fn expect_all_work(cases: Vec<(PathBuf, Op)>, dir: &Path) {
+    let failures: Vec<String> = cases
+        .into_iter()
+        .filter_map(|(f, op)| {
+            run_checked(op, std::slice::from_ref(&f), dir, 120)
+                .err()
+                .map(|e| format!("{} → {}: {e}", f.file_name().unwrap().to_string_lossy(), op.label()))
+        })
+        .collect();
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// Resize… at its default 50% on an animated GIF or a multi-page TIFF: ImageMagick reads the `%`
+/// in `name (50%).gif` as a frame pattern and writes `name (50%)-0.gif`, and the run reports
+/// success with an output that does not exist.
+#[test]
+#[ignore = "BUG: Resize 50% on a GIF animation or multi-page TIFF reports a file that does not exist"]
+fn bug_resize_on_animations_and_multi_page_images() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    sh(d, im(), &["-size", "64x48", "xc:red", "xc:blue", "-set", "delay", "20", "anim.gif"]);
+    sh(d, im(), &["-size", "64x48", "xc:red", "xc:blue", "pages.tiff"]);
+    expect_all_work(
+        vec![(d.join("anim.gif"), Op::Tool(Tool::Resize)), (d.join("pages.tiff"), Op::Tool(Tool::Resize))],
+        d,
+    );
+}
+
+/// Normalize: `loudnorm` outputs 192 kHz, which the WMA encoder refuses (no `-ar` is given).
+#[test]
+#[ignore = "BUG: Normalize fails on WMA (loudnorm resamples to 192 kHz)"]
+fn bug_normalize_wma() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    ff(d, &["-f", "lavfi", "-i", "sine=duration=1", "-c:a", "wmav2", "a.wma"]);
+    expect_all_work(vec![(d.join("a.wma"), Op::Tool(Tool::NormalizeAudio))], d);
+}
+
+/// Speed…: `-fps_mode passthrough` hands the encoder duplicate timestamps, which AVI, WMV, MPG and
+/// FLV encoders refuse ("Invalid pts").
+#[test]
+#[ignore = "BUG: Speed fails on AVI, WMV, MPG and FLV"]
+fn bug_speed_on_avi_wmv_mpg_flv() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let cases = vec![
+        (ff_sample(d, "a.avi", &["-c:v", "mpeg4", "-c:a", "libmp3lame"]), Op::Tool(Tool::Speed)),
+        (ff_sample(d, "a.wmv", &["-c:v", "wmv2", "-c:a", "wmav2"]), Op::Tool(Tool::Speed)),
+        (ff_sample(d, "a.mpg", &["-c:v", "mpeg2video", "-c:a", "mp2"]), Op::Tool(Tool::Speed)),
+        (ff_sample(d, "a.flv", &["-c:v", "flv1", "-c:a", "libmp3lame", "-ar", "44100"]), Op::Tool(Tool::Speed)),
+    ];
+    expect_all_work(cases, d);
+}
+
+/// MPG → MKV stream-copies (`-c copy`), and MPEG-PS packets without timestamps cannot be muxed.
+#[test]
+#[ignore = "BUG: MPG to MKV fails (stream copy of packets without timestamps)"]
+fn bug_mpg_to_mkv() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mpg = ff_sample(d, "a.mpg", &["-c:v", "mpeg2video", "-c:a", "mp2"]);
+    expect_all_work(vec![(mpg, Op::Convert("mkv"))], d);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The command line (the built binary)
+// ---------------------------------------------------------------------------------------------
+
+/// The `clementine` binary next to this test binary, built once if needed.
+fn binary() -> PathBuf {
+    static BIN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BIN.get_or_init(|| {
+        let exe = std::env::current_exe().unwrap();
+        let bin = exe.parent().unwrap().parent().unwrap().join("clementine");
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        let ok = Command::new(cargo)
+            .args(["build", "--quiet", "--bin", "clementine"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(ok && bin.is_file(), "could not build {}", bin.display());
+        bin
+    })
+    .clone()
+}
+
+struct CliResult {
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+/// Runs the CLI with its own config and cache folders under `home`, without a terminal.
+fn cli(home: &Path, args: &[&OsStr], secs: u64) -> Option<CliResult> {
+    let mut cmd = Command::new(binary());
+    cmd.args(args)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = cmd.spawn().ok()?;
+    let id = child.id();
+    let out = within(secs, move || child.wait_with_output());
+    let Some(out) = out else {
+        let _ = Command::new("kill").arg(id.to_string()).status();
+        return None;
+    };
+    let out = out.ok()?;
+    Some(CliResult {
+        code: out.status.code(),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    })
+}
+
+/// `--convert` / `--tool` on every hostile name: exit 0, each printed path exists, nothing else
+/// appears.
+#[test]
+#[ignore = "slow: runs the converters"]
+fn qa_cli_takes_hostile_names_literally() {
+    let home = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    make_base(root.path());
+    let base = root.path().join("base");
+    let mut bad = Vec::new();
+    // A name that starts with `--` must come after `--`.
+    let mut stems: Vec<&str> = HOSTILE.iter().copied().filter(|s| !s.contains('\n')).collect();
+    stems.push("--double-dash");
+    for (i, stem) in stems.iter().enumerate() {
+        let dir = root.path().join(format!("c{i}"));
+        std::fs::create_dir(&dir).unwrap();
+        for (src, ext, flag, what) in [
+            ("s.png", "png", "--convert", "jpg"),
+            ("s.pdf", "pdf", "--tool", "split"),
+            ("s.mp4", "mp4", "--tool", "thumbnail"),
+            ("s.zip", "zip", "--tool", "extract"),
+            ("s.png", "png", "--tool", "zip"),
+        ] {
+            let file = dir.join(format!("{stem}.{ext}"));
+            if !file.exists() {
+                std::fs::copy(base.join(src), &file).unwrap();
+            }
+            let before = listing(&dir);
+            let args = [OsStr::new(flag), OsStr::new(what), OsStr::new("--"), file.as_os_str()];
+            let name = format!("{stem:?}.{ext} {flag} {what}");
+            let Some(r) = cli(home.path(), &args, 120) else {
+                bad.push(format!("{name}: timed out"));
+                continue;
+            };
+            let outs: Vec<PathBuf> = r.stdout.lines().map(PathBuf::from).collect();
+            if r.code != Some(0) || outs.is_empty() {
+                bad.push(format!("{name}: exit {:?}: {}", r.code, r.stderr.trim()));
+                continue;
+            }
+            if let Err(e) = outs.iter().try_for_each(|o| looks_valid(o)) {
+                bad.push(format!("{name}: {e}"));
+            }
+            let stray: Vec<_> = listing(&dir)
+                .difference(&before)
+                .filter(|p| !outs.iter().any(|o| dir.join(p).starts_with(o)))
+                .cloned()
+                .collect();
+            if !stray.is_empty() {
+                bad.push(format!("{name}: left {stray:?}"));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "\n{}", bad.join("\n"));
+}
+
+/// Broken, missing and unsuitable inputs: a non-zero exit, a message on stderr, nothing left behind.
+#[test]
+#[ignore = "slow: runs the converters"]
+fn qa_cli_fails_cleanly() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let files = broken_samples(d);
+    let mut bad = Vec::new();
+    let mut cases: Vec<(Vec<std::ffi::OsString>, i32)> = Vec::new();
+    for f in &files {
+        let target = match kind_of(f) {
+            Kind::Image => "webp",
+            Kind::Pdf | Kind::Slides => "png",
+            Kind::Video => "gif",
+            Kind::Audio => "flac",
+            Kind::Archive => "tar",
+            Kind::Document => "html",
+            Kind::Spreadsheet => "csv",
+            _ => continue,
+        };
+        cases.push((vec!["--convert".into(), target.into(), f.clone().into()], 1));
+    }
+    cases.push((vec!["--convert".into(), "png".into(), d.join("missing.jpg").into()], 1));
+    cases.push((vec!["--convert".into(), "mp3".into(), d.join("text.pdf").into()], 1));
+    cases.push((vec!["--tool".into(), "trim".into(), "--start".into(), "5".into(), d.join("trunc.mp4").into()], 1));
+    cases.push((vec!["--convert".into()], 2));
+    for (args, want) in cases {
+        let before = listing(d);
+        let a: Vec<&OsStr> = args.iter().map(|s| s.as_os_str()).collect();
+        let name = format!("{args:?}");
+        let Some(r) = cli(home.path(), &a, 120) else {
+            bad.push(format!("{name}: timed out"));
+            continue;
+        };
+        let left: Vec<_> = listing(d).difference(&before).cloned().collect();
+        if r.code == Some(0) {
+            // Lenient converters may accept junk; then the result must at least read back.
+            let outs: Vec<PathBuf> = r.stdout.lines().map(PathBuf::from).collect();
+            match outs.iter().try_for_each(|o| looks_valid(o)) {
+                Ok(()) => println!("lenient {name}"),
+                Err(e) => bad.push(format!("{name}: exit 0 with a bad result: {e}")),
+            }
+            for o in outs {
+                let _ = if o.is_dir() { std::fs::remove_dir_all(o) } else { std::fs::remove_file(o) };
+            }
+            continue;
+        }
+        if r.code != Some(want) {
+            bad.push(format!("{name}: exit {:?}, wanted {want}: {}", r.code, r.stderr.trim()));
+        }
+        if !r.stderr.contains("clementine") {
+            bad.push(format!("{name}: no message: {:?}", r.stderr));
+        }
+        if !left.is_empty() {
+            bad.push(format!("{name}: left {left:?}"));
+        }
+        if r.stderr.contains("panicked") {
+            bad.push(format!("{name}: panicked: {}", r.stderr));
+        }
+    }
+    assert!(bad.is_empty(), "\n{}", bad.join("\n"));
+}
+
+/// Two Clementine processes (two file-manager menu clicks, or the CLI next to the window) convert
+/// with LibreOffice at once. `LO_LOCK` only queues calls inside one process; across processes
+/// both share `~/.cache/clementine/libreoffice`, and the second LibreOffice hands its job to the
+/// first and exits 1 without a message.
+#[test]
+#[ignore = "BUG: two processes converting with LibreOffice at once fail silently (shared profile)"]
+fn bug_two_processes_convert_with_libreoffice_at_once() {
+    if !has_program("soffice") {
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let files: Vec<PathBuf> = (0..4)
+        .map(|i| {
+            let f = d.join(format!("t{i}.csv"));
+            std::fs::write(&f, format!("a,b\n{i},2\n")).unwrap();
+            f
+        })
+        .collect();
+    // Warm the profile first, so this is not about the first start.
+    let warm = cli(home.path(), &[OsStr::new("--convert"), OsStr::new("ods"), files[0].as_os_str()], 180).unwrap();
+    assert_eq!(warm.code, Some(0), "{}", warm.stderr);
+    let results: Vec<Option<CliResult>> = std::thread::scope(|s| {
+        let hs: Vec<_> = files
+            .iter()
+            .map(|f| {
+                let home = home.path();
+                s.spawn(move || cli(home, &[OsStr::new("--convert"), OsStr::new("xlsx"), f.as_os_str()], 180))
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let bad: Vec<String> = results
+        .iter()
+        .zip(&files)
+        .filter_map(|(r, f)| match r {
+            None => Some(format!("{}: timed out", f.display())),
+            Some(r) if r.code != Some(0) => Some(format!("{}: exit {:?}: {}", f.display(), r.code, r.stderr.trim())),
+            Some(_) => None,
+        })
+        .collect();
+    assert!(bad.is_empty(), "\n{}", bad.join("\n"));
 }
