@@ -70,29 +70,81 @@ pub struct Job {
 }
 
 /// Hands out output paths that exist neither on disk nor earlier in the same batch.
+///
+/// For a real run the names are *reserved*: each claim creates its empty file (`O_CREAT|O_EXCL`)
+/// or folder (`mkdir`) on the spot, so two threads or two Susen processes can never be handed
+/// the same name. Converters then write into that placeholder (see [`Ctx::fresh`]); a failed or
+/// cancelled job removes it.
 #[derive(Default)]
 pub struct Names {
     taken: HashSet<PathBuf>,
     /// When set, every claim lands here instead of in the folder asked for.
     dest: Option<PathBuf>,
+    /// Create each claimed name on disk (a real run), or only look (planning).
+    reserve: bool,
+    /// What a reserving claim created, so a plan that fails half-way can take it back.
+    created: Vec<PathBuf>,
 }
 
 impl Names {
     /// `dir/stem.ext`, or `dir/stem (2).ext`, `dir/stem (3).ext`… An empty `ext` names a folder.
-    pub fn claim(&mut self, dir: &Path, stem: &str, ext: &str) -> PathBuf {
-        let dir = self.dest.as_deref().unwrap_or(dir);
+    pub fn claim(&mut self, dir: &Path, stem: &str, ext: &str) -> Result<PathBuf> {
+        let dir = self.dest.clone().unwrap_or_else(|| dir.to_path_buf());
         for n in 1.. {
             let base = if n == 1 { stem.to_string() } else { format!("{stem} ({n})") };
             let name = if ext.is_empty() { base } else { format!("{base}.{ext}") };
             let path = dir.join(name);
-            // `symlink_metadata`: a dangling link is taken too, or a converter would write through it.
-            if std::fs::symlink_metadata(&path).is_err() && !self.taken.contains(&path) {
-                self.taken.insert(path.clone());
-                return path;
+            if self.taken.contains(&path) {
+                continue;
+            }
+            if !self.reserve {
+                // `symlink_metadata`: a dangling link is taken too, or a converter would write through it.
+                if std::fs::symlink_metadata(&path).is_err() {
+                    self.taken.insert(path.clone());
+                    return Ok(path);
+                }
+                continue;
+            }
+            // `create_new` and `create_dir` fail on anything already there, dangling links included.
+            let made = if ext.is_empty() {
+                std::fs::create_dir(&path)
+            } else {
+                std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map(drop)
+            };
+            match made {
+                Ok(()) => {
+                    self.taken.insert(path.clone());
+                    self.created.push(path.clone());
+                    return Ok(path);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e).with_context(|| format!("creating {}", path.display())),
             }
         }
         unreachable!()
     }
+
+    /// Removes every placeholder this has created.
+    fn release(&mut self) {
+        for path in self.created.drain(..) {
+            remove_output(&path);
+        }
+    }
+}
+
+/// Removes an output (a file, or a folder and everything in it), ignoring errors.
+fn remove_output(path: &Path) {
+    let is_dir = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
+    let _ = if is_dir { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) };
+}
+
+/// A fresh name in the scratch folder, safe for any program (`s7.png`): no `%`, glob characters,
+/// spaces or colons, whatever the input was called.
+fn scratch_file(scratch: &Path, ext: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    if ext.is_empty() { scratch.join(format!("s{n}")) } else { scratch.join(format!("s{n}.{ext}")) }
 }
 
 /// File name without the extension that [`extension`] reports (`a.tar.gz` gives `a`).
@@ -480,9 +532,18 @@ fn convert_job(input: &Path, target: &'static str, scratch: &Path, names: &mut N
     let name = stem(input);
     let src = canonical(&extension(input)).to_string();
     let mut steps = Vec::new();
-    let mut out = names.claim(&dir, &name, target);
+    let kind = kind_of(input);
+    if kind == Kind::Other {
+        bail!("{} cannot be converted", input.display());
+    }
+    // PDF and slides to images give a folder of pages; everything else one file.
+    let out = if matches!(kind, Kind::Pdf | Kind::Slides) && matches!(target, "png" | "jpg") {
+        names.claim(&dir, &format!("{name} ({target})"), "")?
+    } else {
+        names.claim(&dir, &name, target)?
+    };
 
-    match kind_of(input) {
+    match kind {
         Kind::Image => {
             // Only the first frame of an animation or layered file becomes a still.
             let frame = if matches!(src.as_str(), "gif" | "tiff") && target != src { "[0]" } else { "" };
@@ -495,7 +556,6 @@ fn convert_job(input: &Path, target: &'static str, scratch: &Path, names: &mut N
         Kind::Subtitle => steps.push(Step::Run(ffmpeg(input).arg(&out))),
         Kind::Pdf => match target {
             "png" | "jpg" => {
-                out = names.claim(&dir, &format!("{name} ({target})"), "");
                 pdf_pages(&mut steps, input, target, &out, &name);
             }
             "txt" => steps.push(Step::Run(Cmd::new("pdftotext").arg("-layout").arg(input).arg(&out))),
@@ -532,24 +592,28 @@ fn convert_job(input: &Path, target: &'static str, scratch: &Path, names: &mut N
             "png" | "jpg" => {
                 let pdf = scratch.join(format!("{name}.pdf"));
                 soffice_to(&mut steps, input, "pdf", "pdf", scratch, pdf.clone());
-                out = names.claim(&dir, &format!("{name} ({target})"), "");
                 pdf_pages(&mut steps, &pdf, target, &out, &name);
             }
             _ => soffice_to(&mut steps, input, target, target, scratch, out.clone()),
         },
         Kind::Archive => {
-            let unpacked = scratch.join(format!("x-{name}"));
+            let unpacked = scratch_file(scratch, "");
             steps.push(Step::MkDir(unpacked.clone()));
             steps.extend(extract(input, &unpacked));
+            // zip refuses to add to the empty placeholder ("structure invalid"): it packs in scratch.
+            let zipped = scratch_file(scratch, "zip");
             let pack = match target {
                 // `-y` stores links as links: an archive's link must never pull in the file it names.
-                "zip" => Cmd::new("zip").args(["-r", "-q", "-y"]).arg(&out).arg("."),
+                "zip" => Cmd::new("zip").args(["-r", "-q", "-y"]).arg(&zipped).arg("."),
                 "tar" => Cmd::new("tar").arg("-cf").arg(&out).arg("."),
                 _ => Cmd::new("tar").arg("-czf").arg(&out).arg("."),
             };
             steps.push(Step::Run(Cmd { cwd: Some(unpacked), ..pack }));
+            if target == "zip" {
+                steps.push(Step::Move { from: zipped, to: out.clone() });
+            }
         }
-        Kind::Other => bail!("{} cannot be converted", input.display()),
+        Kind::Other => unreachable!(),
     }
     Ok(Job { steps, outputs: vec![out] })
 }
@@ -634,7 +698,7 @@ fn tool_job(input: &Path, tool: Tool, setup: &Setup, names: &mut Names) -> Resul
     };
     let out = match tool {
         Tool::CompressImage => {
-            let out = names.claim(&dir, &format!("{name} (compressed)"), &ext);
+            let out = names.claim(&dir, &format!("{name} (compressed)"), &ext)?;
             let extra: &[&str] = if ext == "png" { &["-define", "png:compression-level=9"] } else { &[] };
             steps.push(im(&out, &[&["-strip", "-quality", "75"], extra].concat()));
             out
@@ -647,7 +711,7 @@ fn tool_job(input: &Path, tool: Tool, setup: &Setup, names: &mut Names) -> Resul
                 Some(Params::Resize(Resize::Percent(p))) => (format!("{p}%"), format!("{p}%")),
                 _ => bail!("Resize needs a size"),
             };
-            let out = names.claim(&dir, &format!("{name} ({label})"), &ext);
+            let out = names.claim(&dir, &format!("{name} ({label})"), &ext)?;
             steps.push(im(&out, &["-resize", &geometry]));
             out
         }
@@ -658,22 +722,22 @@ fn tool_job(input: &Path, tool: Tool, setup: &Setup, names: &mut Names) -> Resul
                 Some(Params::Crop(Crop::Rect { x, y, w, h })) => ("northwest", format!("{w}x{h}+{x}+{y}")),
                 _ => bail!("Crop needs a size"),
             };
-            let out = names.claim(&dir, &format!("{name} (cropped)"), &ext);
+            let out = names.claim(&dir, &format!("{name} (cropped)"), &ext)?;
             steps.push(im(&out, &["-gravity", gravity, "-crop", &geometry, "+repage"]));
             out
         }
         Tool::Rotate90 => {
-            let out = names.claim(&dir, &format!("{name} (rotated)"), &ext);
+            let out = names.claim(&dir, &format!("{name} (rotated)"), &ext)?;
             steps.push(im(&out, &["-rotate", "90"]));
             out
         }
         Tool::StripMetadata => {
-            let out = names.claim(&dir, &format!("{name} (clean)"), &ext);
+            let out = names.claim(&dir, &format!("{name} (clean)"), &ext)?;
             steps.push(im(&out, &["-strip"]));
             out
         }
         Tool::CompressVideo => {
-            let out = names.claim(&dir, &format!("{name} (compressed)"), "mp4");
+            let out = names.claim(&dir, &format!("{name} (compressed)"), "mp4")?;
             let args = [
                 "-c:v",
                 "libx264",
@@ -694,33 +758,33 @@ fn tool_job(input: &Path, tool: Tool, setup: &Setup, names: &mut Names) -> Resul
             out
         }
         Tool::HalfResVideo => {
-            let out = names.claim(&dir, &format!("{name} (half size)"), &ext);
+            let out = names.claim(&dir, &format!("{name} (half size)"), &ext)?;
             steps.push(Step::Run(
                 ffmpeg(input).args(["-vf", "scale=trunc(iw/4)*2:trunc(ih/4)*2", "-c:a", "copy"]).arg(&out),
             ));
             out
         }
         Tool::MuteVideo => {
-            let out = names.claim(&dir, &format!("{name} (muted)"), &ext);
+            let out = names.claim(&dir, &format!("{name} (muted)"), &ext)?;
             steps.push(Step::Run(ffmpeg(input).args(["-c:v", "copy", "-an"]).arg(&out)));
             out
         }
         Tool::Thumbnail => {
             let Some(Params::Thumbnail { at }) = setup.params else { bail!("Thumbnail needs a time") };
-            let out = names.claim(&dir, &format!("{name} (thumbnail)"), "jpg");
+            let out = names.claim(&dir, &format!("{name} (thumbnail)"), "jpg")?;
             let args = ["-frames:v", "1", "-q:v", "2", "-update", "1"];
             steps.push(Step::Run(ffmpeg_from(input, at).args(args).arg(&out)));
             out
         }
         Tool::Trim => {
             let Some(Params::Trim { start, end }) = setup.params else { bail!("Trim needs a range") };
-            let out = names.claim(&dir, &format!("{name} (trimmed)"), &ext);
+            let out = names.claim(&dir, &format!("{name} (trimmed)"), &ext)?;
             steps.push(Step::Run(cut(input, start, end - start, &out)));
             out
         }
         Tool::SplitMedia => {
             let Some(Params::Split(by)) = setup.params else { bail!("Split needs a part length") };
-            let out = names.claim(&dir, &format!("{name} (parts)"), "");
+            let out = names.claim(&dir, &format!("{name} (parts)"), "")?;
             steps.push(Step::MkDir(out.clone()));
             let parts = split_points(setup.duration(input)?, by);
             let width = parts.len().to_string().len();
@@ -732,7 +796,7 @@ fn tool_job(input: &Path, tool: Tool, setup: &Setup, names: &mut Names) -> Resul
         }
         Tool::Speed => {
             let Some(Params::Speed(f)) = setup.params else { bail!("Speed needs a factor") };
-            let out = names.claim(&dir, &format!("{name} ({})", speed_name(f)), &ext);
+            let out = names.claim(&dir, &format!("{name} ({})", speed_name(f)), &ext)?;
             let mut cmd = ffmpeg(input);
             if kind_of(input) == Kind::Video {
                 // Passthrough keeps every frame at its new time; the default constant frame rate
@@ -756,19 +820,19 @@ fn tool_job(input: &Path, tool: Tool, setup: &Setup, names: &mut Names) -> Resul
                 let from = (setup.duration(input)? - fade_out).max(0.0);
                 fades.push(format!("afade=t=out:st={}:d={}", trim_number(from), trim_number(fade_out)));
             }
-            let out = names.claim(&dir, &format!("{name} (faded)"), &ext);
+            let out = names.claim(&dir, &format!("{name} (faded)"), &ext)?;
             let cmd = ffmpeg(input).arg("-filter:a").arg(fades.join(",")).args(reencode(input).iter().copied());
             steps.push(Step::Run(cmd.arg(&out)));
             out
         }
         Tool::MonoAudio => {
-            let out = names.claim(&dir, &format!("{name} (mono)"), &ext);
+            let out = names.claim(&dir, &format!("{name} (mono)"), &ext)?;
             steps.push(Step::Run(ffmpeg(input).args(["-ac", "1"]).args(reencode(input).iter().copied()).arg(&out)));
             out
         }
         Tool::RotatePdf => {
             let Some(Params::RotatePages(angle)) = setup.params else { bail!("Rotate needs an angle") };
-            let out = names.claim(&dir, &format!("{name} (rotated)"), "pdf");
+            let out = names.claim(&dir, &format!("{name} (rotated)"), "pdf")?;
             let cmd = Cmd::new("qpdf").arg("--warning-exit-0").arg(input).arg(format!("--rotate=+{angle}")).arg(&out);
             steps.push(Step::Run(cmd));
             out
@@ -776,7 +840,7 @@ fn tool_job(input: &Path, tool: Tool, setup: &Setup, names: &mut Names) -> Resul
         Tool::ExtractPages => {
             let Some(Params::Pages { first, last }) = setup.params else { bail!("Pages needs a range") };
             let range = if first == last { format!("page {first}") } else { format!("pages {first}-{last}") };
-            let out = names.claim(&dir, &format!("{name} ({range})"), "pdf");
+            let out = names.claim(&dir, &format!("{name} ({range})"), "pdf")?;
             if has_program("qpdf") {
                 let cmd = Cmd::new("qpdf").args(["--warning-exit-0", "--empty", "--pages"]).arg(input);
                 steps.push(Step::Run(cmd.arg(format!("{first}-{last}")).arg("--").arg(&out)));
@@ -792,17 +856,17 @@ fn tool_job(input: &Path, tool: Tool, setup: &Setup, names: &mut Names) -> Resul
             out
         }
         Tool::CompressAudio => {
-            let out = names.claim(&dir, &format!("{name} (compressed)"), "mp3");
+            let out = names.claim(&dir, &format!("{name} (compressed)"), "mp3")?;
             steps.push(Step::Run(ffmpeg(input).args(["-vn", "-c:a", "libmp3lame", "-b:a", "128k"]).arg(&out)));
             out
         }
         Tool::NormalizeAudio => {
-            let out = names.claim(&dir, &format!("{name} (normalized)"), &ext);
+            let out = names.claim(&dir, &format!("{name} (normalized)"), &ext)?;
             steps.push(Step::Run(ffmpeg(input).args(["-af", "loudnorm"]).arg(&out)));
             out
         }
         Tool::CompressPdf => {
-            let out = names.claim(&dir, &format!("{name} (compressed)"), "pdf");
+            let out = names.claim(&dir, &format!("{name} (compressed)"), "pdf")?;
             let args = ["-sDEVICE=pdfwrite", "-dPDFSETTINGS=/ebook", "-dNOPAUSE", "-dBATCH", "-dQUIET"];
             // Ghostscript reads `%d` in the output name as a page number; `%%` is a literal `%`.
             let mut o = OsString::from("-sOutputFile=");
@@ -811,13 +875,13 @@ fn tool_job(input: &Path, tool: Tool, setup: &Setup, names: &mut Names) -> Resul
             out
         }
         Tool::SplitPdf => {
-            let out = names.claim(&dir, &format!("{name} (pages)"), "");
+            let out = names.claim(&dir, &format!("{name} (pages)"), "")?;
             steps.push(Step::MkDir(out.clone()));
             steps.push(Step::Run(Cmd::new("pdfseparate").arg(input).arg(out.join(format!("{name}-%d.pdf")))));
             out
         }
         Tool::Extract => {
-            let out = names.claim(&dir, &name, "");
+            let out = names.claim(&dir, &name, "")?;
             steps.push(Step::MkDir(out.clone()));
             steps.extend(extract(input, &out));
             out
@@ -844,29 +908,47 @@ pub fn plan_in(
     scratch: &Path,
     dest: Option<&Path>,
 ) -> Result<Vec<Job>> {
-    // Inputs are claimed up front, so no output can ever be named after one.
-    let mut names = Names { taken: files.iter().cloned().collect(), dest: dest.map(Path::to_path_buf) };
+    plan_names(op, files, params, scratch, &mut names_for(files, dest, false))
+}
+
+/// Inputs are claimed up front, so no output can ever be named after one.
+fn names_for(files: &[PathBuf], dest: Option<&Path>, reserve: bool) -> Names {
+    Names { taken: files.iter().cloned().collect(), dest: dest.map(Path::to_path_buf), reserve, created: Vec::new() }
+}
+
+fn plan_names(
+    op: Op,
+    files: &[PathBuf],
+    params: Option<&Params>,
+    scratch: &Path,
+    names: &mut Names,
+) -> Result<Vec<Job>> {
     let first = files.first().ok_or_else(|| anyhow!("nothing selected"))?;
     match op {
-        Op::Convert(target) => files.iter().map(|f| convert_job(f, target, scratch, &mut names)).collect(),
+        Op::Convert(target) => files.iter().map(|f| convert_job(f, target, scratch, names)).collect(),
         Op::Tool(Tool::MergePdf) => {
-            let out = names.claim(&parent(first), "Merged", "pdf");
+            let out = names.claim(&parent(first), "Merged", "pdf")?;
             let cmd = Cmd::new("pdfunite").args(files.iter().map(|f| f.as_os_str().to_owned())).arg(&out);
             Ok(vec![Job { steps: vec![Step::Run(cmd)], outputs: vec![out] }])
         }
         Op::Tool(Tool::Zip) => {
             let dir = parent(first);
             let base = if files.len() == 1 { stem(first) } else { "Archive".into() };
-            let out = names.claim(&dir, &base, "zip");
+            let out = names.claim(&dir, &base, "zip")?;
             // Same folder: store bare names. Mixed folders: store full paths.
             let same = files.iter().all(|f| parent(f) == dir);
             // `--`: a bare name such as `-v.png` is a file, not an option.
-            let mut cmd = Cmd::new("zip").args(["-r", "-q"]).arg(&out).arg("--");
+            // Packed in scratch: zip refuses to add to the empty placeholder.
+            let zipped = scratch_file(scratch, "zip");
+            let mut cmd = Cmd::new("zip").args(["-r", "-q"]).arg(&zipped).arg("--");
             for f in files {
                 cmd = cmd.arg(if same { f.file_name().unwrap().to_owned() } else { f.as_os_str().to_owned() });
             }
             cmd.cwd = Some(dir);
-            Ok(vec![Job { steps: vec![Step::Run(cmd)], outputs: vec![out] }])
+            Ok(vec![Job {
+                steps: vec![Step::Run(cmd), Step::Move { from: zipped, to: out.clone() }],
+                outputs: vec![out],
+            }])
         }
         Op::Tool(tool) => {
             let setup = Setup {
@@ -874,7 +956,7 @@ pub fn plan_in(
                 probe: params.is_some(),
                 scratch,
             };
-            files.iter().map(|f| tool_job(f, tool, &setup, &mut names)).collect()
+            files.iter().map(|f| tool_job(f, tool, &setup, names)).collect()
         }
         Op::Action(_) => bail!("actions are handled by the window"),
     }
@@ -906,11 +988,13 @@ struct Ctx<'a> {
     cancel: &'a Cancel,
     /// Called with how far the running step has got, when the program says.
     within: &'a dyn Fn(Option<f64>),
+    /// The job's reserved, still empty outputs: the only existing files a program may write over.
+    fresh: &'a [PathBuf],
 }
 
 #[cfg(test)]
 fn run_cmd(cmd: &Cmd) -> Result<()> {
-    run_cmd_with(cmd, &Ctx { cancel: &Cancel::new(), within: &|_| {} })
+    run_cmd_with(cmd, &Ctx { cancel: &Cancel::new(), within: &|_| {}, fresh: &[] })
 }
 
 /// Runs `cmd` in its own process group, so a cancel reaches everything it spawns. ffmpeg is asked
@@ -931,6 +1015,11 @@ fn run_cmd_with(cmd: &Cmd, ctx: &Ctx) -> Result<()> {
         lock_down_lo_profile(&lo_profile()).context("preparing the LibreOffice profile")?;
     }
     let mut c = command(&cmd.program);
+    // ffmpeg will not write over a file without `-y` — not even the empty placeholder reserved for
+    // this very output. It gets `-y` for that file only, so anything else is still never replaced.
+    if cmd.program == "ffmpeg" && cmd.args.last().is_some_and(|out| ctx.fresh.iter().any(|f| f.as_os_str() == out)) {
+        c.arg("-y");
+    }
     if ffmpeg {
         c.args(["-progress", "pipe:1", "-nostats"]);
     }
@@ -1092,7 +1181,14 @@ pub fn run_with(
     if let Some(dest) = dest {
         std::fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
     }
-    let jobs = plan_in(op, files, params, scratch.path(), dest)?;
+    let mut names = names_for(files, dest, true);
+    let jobs = match plan_names(op, files, params, scratch.path(), &mut names) {
+        Ok(jobs) => jobs,
+        Err(e) => {
+            names.release();
+            return Err(e);
+        }
+    };
     let mut produced = Vec::new();
     for (j, job) in jobs.iter().enumerate() {
         let steps = job.steps.iter().filter(|s| is_work(s)).count();
@@ -1107,21 +1203,35 @@ pub fn run_with(
                 report(at);
             }
             let within = |w: Option<f64>| report(Progress { within: w, ..at });
-            run_step(s, &Ctx { cancel, within: &within })?;
+            run_step(s, &Ctx { cancel, within: &within, fresh: &job.outputs })?;
             if is_work(s) {
                 step += 1;
             }
             Ok::<(), anyhow::Error>(())
         });
-        if let Err(e) = result {
-            for out in &job.outputs {
-                let _ = if out.is_dir() { std::fs::remove_dir_all(out) } else { std::fs::remove_file(out) };
+        if let Err(e) = result.and_then(|()| job.outputs.iter().try_for_each(|o| check_output(o))) {
+            // This job's outputs and the placeholders of the jobs that will not run now.
+            for out in jobs[j..].iter().flat_map(|job| &job.outputs) {
+                remove_output(out);
             }
             return Err(e);
         }
         produced.extend(job.outputs.iter().cloned());
     }
     Ok(produced)
+}
+
+/// Fails unless `out` is a non-empty file or a non-empty folder, so a converter that exits 0
+/// without writing what was asked (or writes it under another name) is a visible failure.
+fn check_output(out: &Path) -> Result<()> {
+    let name = out.file_name().unwrap_or_default().to_string_lossy();
+    let meta = std::fs::symlink_metadata(out).with_context(|| format!("the converter produced no {name}"))?;
+    let empty =
+        if meta.is_dir() { std::fs::read_dir(out)?.next().is_none() } else { !meta.is_file() || meta.len() == 0 };
+    if empty {
+        bail!("the converter produced nothing for {name}");
+    }
+    Ok(())
 }
 
 /// Runs a probe and returns its trimmed stdout, or `None` if it failed.
@@ -1229,9 +1339,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.png"), b"").unwrap();
         let mut n = Names::default();
-        assert_eq!(n.claim(dir.path(), "a", "png"), dir.path().join("a (2).png"));
-        assert_eq!(n.claim(dir.path(), "a", "png"), dir.path().join("a (3).png"));
-        assert_eq!(n.claim(dir.path(), "a", "jpg"), dir.path().join("a.jpg"));
+        assert_eq!(n.claim(dir.path(), "a", "png").unwrap(), dir.path().join("a (2).png"));
+        assert_eq!(n.claim(dir.path(), "a", "png").unwrap(), dir.path().join("a (3).png"));
+        assert_eq!(n.claim(dir.path(), "a", "jpg").unwrap(), dir.path().join("a.jpg"));
     }
 
     #[test]

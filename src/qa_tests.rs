@@ -1221,8 +1221,8 @@ fn race(op: Op, file: &Path, n: usize) -> Vec<PathBuf> {
 
 /// Eight conversions of one file to one format at the same time must give eight files.
 #[test]
-#[ignore = "BUG: Names::claim checks the disk at plan time, so concurrent runs claim the same output"]
-fn bug_concurrent_runs_never_share_an_output() {
+#[ignore = "slow: runs the converters"]
+fn qa_concurrent_runs_never_share_an_output() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     sh(d, im(), &["-size", "400x300", "plasma:", "photo.png"]);

@@ -31,23 +31,24 @@ long time, and Cancel is the remedy), and other processes running as the same us
 | Office document macros | Susen's own LibreOffice profile is pinned to `MacroSecurityLevel=3` and `DisableMacrosExecution=true` before every run. | `the_office_profile_pins_macros_off`, `office_documents_never_run_macros` (ignored, slow) |
 | File names starting with `-` or containing `:` / `[…]` | Every path handed to a program is absolute (`/…`), so it can be neither an option nor a protocol or coder prefix. The CLI makes its arguments absolute; the file-manager menus pass `--` before the files. `notify-send` gets `--` before the text it shows. | `cli::tests::notification_text_is_never_an_option` |
 | Output written through a dangling symlink | Output names count any existing directory entry, links included, as taken. | `a_dangling_link_is_never_an_output_name` |
+| Two runs (threads or processes) given the same output name, one overwriting the other | Each output is reserved when the job is planned: the empty file is created with `O_CREAT\|O_EXCL` (`create_new`), a folder with `mkdir`, either of which fails if anything (a link included) is there, and the next name is tried. Converters write into that placeholder or into scratch and are moved onto it; ffmpeg gets `-y` only when its output is the job's own placeholder. A failed or cancelled job removes its placeholders and those of the jobs that did not run. | `qa_tests::qa_concurrent_runs_never_share_an_output` |
 | Copy/Move following links (copying what a downloaded folder links to; `loop -> .` recursing forever), writing through a link at the destination, moving a folder into itself | Links are copied as links, new files are created with `create_new`, and moving or copying a folder into itself is refused. | `actions::tests::links_are_copied_as_links`, `…dangling_link_at_the_destination…`, `…never_moved_into_itself` |
 | Nautilus script glob-expanding a file named `*` into the whole folder | `set -f` before splitting the selection. | manual |
 
 Scratch files go in a fresh `0700` folder from `tempfile`, removed when the job ends, whether it
-succeeds or fails. A failed job removes the outputs it claimed. Outputs are created by the
-converters with the user's umask.
+succeeds or fails. A failed job removes the outputs it claimed. Every reported output is checked to exist and be
+non-empty (a file) or non-empty (a folder) before the job counts as done. Outputs are created
+with the user's umask.
 
 The Flatpak has no network access (`--share=network` is not granted), so even a converter bug
 cannot reach the network there.
 
 ## Known gaps
 
-- **Output name races.** An output name is chosen when the job is planned and written later.
-  Another process (same user) creating that name in between could have it overwritten by tools
-  that overwrite (ImageMagick, LibreOffice moves), or deleted if the job then fails. Closing this
-  needs every converter to write into scratch and the result to be moved with no-replace
-  semantics. Not worth it for a same-user race.
+- **Output placeholders.** Output names are now reserved atomically (see *Mitigations*), so two
+  runs or two Susen processes never share one. Between the reservation and the write, another
+  process of the same user could still swap the empty placeholder for something else; that is a
+  same-user race and out of scope.
 - **Local media read by playlists.** ffmpeg's HLS and concat demuxers can still read local
   *media* files (their own extension allowlist and `safe=1` rules apply). Restricting demuxers with
   `-format_whitelist` risks breaking ordinary files and was not done.
