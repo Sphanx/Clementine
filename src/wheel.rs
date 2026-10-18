@@ -346,7 +346,7 @@ pub struct Palette {
     pub high_contrast: bool,
 }
 
-/// Clementine's accent: a muted purple. White on it is 5.9:1.
+/// Susen's accent: a muted purple. White on it is 5.9:1.
 pub const ACCENT_LIGHT: Rgb = Rgb(0x6b as f64 / 255.0, 0x5b as f64 / 255.0, 0x95 as f64 / 255.0);
 /// A lighter muted purple for dark themes. White on it is only 3.8:1, so its label is black (5.5:1).
 pub const ACCENT_DARK: Rgb = Rgb(0x8a as f64 / 255.0, 0x7b as f64 / 255.0, 0xb0 as f64 / 255.0);
@@ -358,7 +358,7 @@ fn best_text(bg: Rgb) -> Rgb {
 
 /// Builds the palette from theme colours. `fg_alpha` is the alpha of the theme's text colour
 /// (Adwaita draws text at 80 % black). Missing theme colours fall back to neutral ones.
-/// The selection is Clementine's purple accent; only a high-contrast theme's own accent
+/// The selection is Susen's purple accent; only a high-contrast theme's own accent
 /// (`accent`, `on_accent`) replaces it.
 pub fn palette(
     fg: Rgb,

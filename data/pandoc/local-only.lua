@@ -1,4 +1,4 @@
--- Clementine: used when pandoc's --sandbox is missing or broken. Drops images (and other
+-- Susen: used when pandoc's --sandbox is missing or broken. Drops images (and other
 -- media) that would be read from outside the document's folder or fetched from the network,
 -- so converting an untrusted document never embeds a local file or makes a request.
 local function unsafe(src)

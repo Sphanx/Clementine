@@ -1,0 +1,8 @@
+[Nemo Action]
+Name=Convert to MP3 (Susen)
+Comment=Convert the selected audio or video to MP3
+Exec=susen --convert mp3 --notify -- %F
+Icon-Name=io.github.sphanx.Susen
+Selection=notnone
+Mimetypes=audio/*;video/*;
+Dependencies=susen;

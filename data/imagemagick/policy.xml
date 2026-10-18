@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Clementine's ImageMagick policy, added on top of the system one through
+<!-- Susen's ImageMagick policy, added on top of the system one through
      MAGICK_CONFIGURE_PATH. Inputs are untrusted downloads: no scripting coders,
      no reading files or URLs by name from inside an image, no Ghostscript. -->
 <policymap>

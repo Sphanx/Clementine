@@ -1,4 +1,4 @@
-//! Clementine: drag a file in, tap a modifier, drop it on a format.
+//! Susen: drag a file in, tap a modifier, drop it on a format.
 //!
 //! Shift opens the conversion wheel, Ctrl the tools wheel, Alt the actions wheel.
 //! Wayland never tells a window about keys pressed while a drag from another app
@@ -27,7 +27,7 @@ use gtk::{gdk, gio, glib};
 use catalog::{Mode, Op};
 use wheel::Wheel;
 
-const APP_ID: &str = "io.github.sphanx.Clementine";
+const APP_ID: &str = "io.github.sphanx.Susen";
 
 const CSS: &str = r#"
 .drop-hint { font-size: 1.4em; font-weight: bold; opacity: 0.8; }
@@ -73,7 +73,7 @@ fn main() -> glib::ExitCode {
     };
     let app = gtk::Application::builder().application_id(APP_ID).flags(gio::ApplicationFlags::HANDLES_OPEN).build();
     app.connect_activate(|app| window(app).present());
-    // `clementine file…` and "Open With" both land here; `--wheel` sends the hint "wheel".
+    // `susen file…` and "Open With" both land here; `--wheel` sends the hint "wheel".
     app.connect_open(|app, files, hint| {
         window(app).present();
         if let Some(state) = state() {
@@ -121,7 +121,7 @@ fn window(app: &gtk::Application) -> gtk::ApplicationWindow {
 fn build(app: &gtk::Application) -> Rc<App> {
     let window = gtk::ApplicationWindow::builder()
         .application(app)
-        .title("Clementine")
+        .title("Susen")
         .default_width(560)
         .default_height(620)
         .build();

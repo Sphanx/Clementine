@@ -135,19 +135,19 @@ fn im_input(path: &Path, frame: &str) -> OsString {
     s
 }
 
-/// A folder holding Clementine's `policy.xml`, for `MAGICK_CONFIGURE_PATH`. Written once per run
+/// A folder holding Susen's `policy.xml`, for `MAGICK_CONFIGURE_PATH`. Written once per run
 /// of the app into a private temporary folder.
 fn magick_policy_dir() -> Option<&'static Path> {
     static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
-        let dir = tempfile::Builder::new().prefix("clementine-magick-").tempdir().ok()?;
+        let dir = tempfile::Builder::new().prefix("susen-magick-").tempdir().ok()?;
         std::fs::write(dir.path().join("policy.xml"), include_str!("../data/imagemagick/policy.xml")).ok()?;
         Some(dir.keep())
     })
     .as_deref()
 }
 
-/// A [`Command`] for `program`; ImageMagick also gets Clementine's restrictive policy.
+/// A [`Command`] for `program`; ImageMagick also gets Susen's restrictive policy.
 fn command(program: &str) -> Command {
     let mut c = Command::new(program);
     if matches!(program, "magick" | "convert")
@@ -264,10 +264,10 @@ fn lo_profile() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
         .unwrap_or_else(std::env::temp_dir);
-    cache.join("clementine").join("libreoffice")
+    cache.join("susen").join("libreoffice")
 }
 
-/// Settings pinned in Clementine's own LibreOffice profile: documents are untrusted, so their
+/// Settings pinned in Susen's own LibreOffice profile: documents are untrusted, so their
 /// macros never run, whatever the profile was changed to.
 const LO_LOCKDOWN: &str = r#"<item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="MacroSecurityLevel" oor:op="fuse"><value>3</value></prop></item>
 <item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="DisableMacrosExecution" oor:op="fuse"><value>true</value></prop></item>
@@ -512,7 +512,7 @@ fn convert_job(input: &Path, target: &'static str, scratch: &Path, names: &mut N
 fn pandoc_guard() -> &'static [OsString] {
     static GUARD: std::sync::OnceLock<Vec<OsString>> = std::sync::OnceLock::new();
     GUARD.get_or_init(|| {
-        let Ok(dir) = tempfile::Builder::new().prefix("clementine-pandoc-").tempdir() else { return Vec::new() };
+        let Ok(dir) = tempfile::Builder::new().prefix("susen-pandoc-").tempdir() else { return Vec::new() };
         let probe_in = dir.path().join("probe.md");
         let probe_out = dir.path().join("probe.docx");
         let sandbox_works = std::fs::write(&probe_in, "probe\n").is_ok()
@@ -913,7 +913,7 @@ pub fn run(op: Op, files: &[PathBuf], params: Option<&Params>, dest: Option<&Pat
     {
         bail!("{} needs settings", op.label());
     }
-    let scratch = tempfile::Builder::new().prefix("clementine-").tempdir()?;
+    let scratch = tempfile::Builder::new().prefix("susen-").tempdir()?;
     if let Some(dest) = dest {
         std::fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
     }

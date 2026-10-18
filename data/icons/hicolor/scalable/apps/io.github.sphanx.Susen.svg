@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <!-- Susen app icon: a stylised iris in muted purple (#6B5B95). -->
+  <defs>
+    <linearGradient id="standard" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#9A8DBE"/>
+      <stop offset="1" stop-color="#7A6BA4"/>
+    </linearGradient>
+    <linearGradient id="fall" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#6B5B95"/>
+      <stop offset="1" stop-color="#55487A"/>
+    </linearGradient>
+  </defs>
+  <!-- stem and leaf -->
+  <path d="M128 150 C126 185 124 210 122 244" fill="none" stroke="#6F7D52" stroke-width="9" stroke-linecap="round"/>
+  <path d="M123 238 C100 222 84 196 82 160 C102 182 116 204 123 238Z" fill="#7E8C5E"/>
+  <!-- standards: the three upright petals -->
+  <path d="M128 18 C150 40 156 80 140 120 L116 120 C100 80 106 40 128 18Z" fill="url(#standard)"/>
+  <path d="M60 52 C92 54 120 82 126 122 L106 132 C78 112 62 86 60 52Z" fill="url(#standard)" opacity="0.92"/>
+  <path d="M196 52 C164 54 136 82 130 122 L150 132 C178 112 194 86 196 52Z" fill="url(#standard)" opacity="0.92"/>
+  <!-- falls: the three drooping petals -->
+  <path d="M120 120 C90 112 44 116 22 146 C40 176 88 178 122 146Z" fill="url(#fall)"/>
+  <path d="M136 120 C166 112 212 116 234 146 C216 176 168 178 134 146Z" fill="url(#fall)"/>
+  <path d="M116 132 C110 160 112 188 128 206 C144 188 146 160 140 132Z" fill="url(#fall)"/>
+  <!-- beards -->
+  <path d="M116 134 C96 136 72 140 52 146" fill="none" stroke="#E3C567" stroke-width="7" stroke-linecap="round"/>
+  <path d="M140 134 C160 136 184 140 204 146" fill="none" stroke="#E3C567" stroke-width="7" stroke-linecap="round"/>
+  <path d="M128 144 L128 182" fill="none" stroke="#E3C567" stroke-width="7" stroke-linecap="round"/>
+  <!-- veins -->
+  <g fill="none" stroke="#F1EEF6" stroke-width="2.5" stroke-linecap="round" opacity="0.55">
+    <path d="M128 40 L128 104"/>
+    <path d="M76 66 C94 78 108 96 114 116"/>
+    <path d="M180 66 C162 78 148 96 142 116"/>
+  </g>
+  <circle cx="128" cy="130" r="9" fill="#E3C567"/>
+</svg>

@@ -1,4 +1,4 @@
-//! User settings, kept as JSON in `$XDG_CONFIG_HOME/clementine/config.json`.
+//! User settings, kept as JSON in `$XDG_CONFIG_HOME/susen/config.json`.
 //!
 //! A missing, unreadable or corrupt file gives the defaults, and so does any key missing from it:
 //! settings must never stop the app from starting. The live copy is behind [`get`] / [`update`].
@@ -138,14 +138,14 @@ impl Config {
     }
 }
 
-/// `$XDG_CONFIG_HOME/clementine/config.json`, falling back to `~/.config`. Relative or empty
+/// `$XDG_CONFIG_HOME/susen/config.json`, falling back to `~/.config`. Relative or empty
 /// values are ignored, as the XDG spec says.
 pub fn path_from(xdg: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
     let base = xdg
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .or_else(|| home.map(PathBuf::from).filter(|p| p.is_absolute()).map(|h| h.join(".config")))?;
-    Some(base.join("clementine").join("config.json"))
+    Some(base.join("susen").join("config.json"))
 }
 
 pub fn config_path() -> Option<PathBuf> {
@@ -189,7 +189,7 @@ pub fn update(change: impl FnOnce(&mut Config)) {
     if let Some(path) = config_path()
         && let Err(e) = save_to(&path, &config)
     {
-        eprintln!("clementine: could not save {}: {e}", path.display());
+        eprintln!("susen: could not save {}: {e}", path.display());
     }
     *live() = Some(config);
 }
@@ -201,7 +201,7 @@ mod tests {
     #[test]
     fn round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("deep/clementine/config.json");
+        let path = dir.path().join("deep/susen/config.json");
         let config = Config {
             convert_key: Modifier::Super,
             tools_key: Modifier::Shift,
@@ -278,9 +278,9 @@ mod tests {
     #[test]
     fn config_path_follows_xdg() {
         let os = |s: &str| Some(OsString::from(s));
-        assert_eq!(path_from(os("/xdg"), os("/home/u")), Some("/xdg/clementine/config.json".into()));
-        assert_eq!(path_from(None, os("/home/u")), Some("/home/u/.config/clementine/config.json".into()));
-        assert_eq!(path_from(os("relative"), os("/home/u")), Some("/home/u/.config/clementine/config.json".into()));
+        assert_eq!(path_from(os("/xdg"), os("/home/u")), Some("/xdg/susen/config.json".into()));
+        assert_eq!(path_from(None, os("/home/u")), Some("/home/u/.config/susen/config.json".into()));
+        assert_eq!(path_from(os("relative"), os("/home/u")), Some("/home/u/.config/susen/config.json".into()));
         assert_eq!(path_from(os(""), None), None);
     }
 }

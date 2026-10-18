@@ -2,8 +2,8 @@
 
 ## Threat model
 
-Clementine converts files the user drops on it, and those files are often downloads: **the content
-and the name of every input are untrusted.** Clementine itself parses almost nothing. It hands
+Susen converts files the user drops on it, and those files are often downloads: **the content
+and the name of every input are untrusted.** Susen itself parses almost nothing. It hands
 inputs to ffmpeg, ImageMagick, pandoc, LibreOffice, poppler, qpdf, Ghostscript and the archive
 tools. So the job is to make sure a crafted file cannot use those programs to:
 
@@ -28,7 +28,7 @@ long time, and Cancel is the remedy), and other processes running as the same us
 | ImageMagick scripting and file-reading coders (`msl:`, `text:`, `@list`, URL, PostScript via Ghostscript) | Bundled `data/imagemagick/policy.xml`, loaded through `MAGICK_CONFIGURE_PATH` on top of the system policy. | `magick_refuses_script_and_text_coders`, `svg_cannot_read_local_files_through_coders` |
 | Disguised HLS playlist or concat list making ffmpeg fetch URLs | `-protocol_whitelist file` on every ffmpeg and ffprobe input. | `media_playlists_cannot_reach_the_network` |
 | Document naming local images (`![](/home/…)`) or remote ones, embedded by pandoc | `--sandbox` when a probe shows it works. pandoc 3.1.3 cannot read its own DOCX/ODT/EPUB templates in the sandbox, so otherwise `data/pandoc/local-only.lua` drops images with a URL scheme, an absolute path, `~` or `..`. | `documents_cannot_embed_local_files` |
-| Office document macros | Clementine's own LibreOffice profile is pinned to `MacroSecurityLevel=3` and `DisableMacrosExecution=true` before every run. | `the_office_profile_pins_macros_off`, `office_documents_never_run_macros` (ignored, slow) |
+| Office document macros | Susen's own LibreOffice profile is pinned to `MacroSecurityLevel=3` and `DisableMacrosExecution=true` before every run. | `the_office_profile_pins_macros_off`, `office_documents_never_run_macros` (ignored, slow) |
 | File names starting with `-` or containing `:` / `[…]` | Every path handed to a program is absolute (`/…`), so it can be neither an option nor a protocol or coder prefix. The CLI makes its arguments absolute; the file-manager menus pass `--` before the files. `notify-send` gets `--` before the text it shows. | `cli::tests::notification_text_is_never_an_option` |
 | Output written through a dangling symlink | Output names count any existing directory entry, links included, as taken. | `a_dangling_link_is_never_an_output_name` |
 | Copy/Move following links (copying what a downloaded folder links to; `loop -> .` recursing forever), writing through a link at the destination, moving a folder into itself | Links are copied as links, new files are created with `create_new`, and moving or copying a folder into itself is refused. | `actions::tests::links_are_copied_as_links`, `…dangling_link_at_the_destination…`, `…never_moved_into_itself` |

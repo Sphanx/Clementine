@@ -59,7 +59,7 @@ pub fn headline(raw: &str) -> String {
         return "The disk is full.".into();
     }
     if has(&["permission denied", "read-only file system"]) {
-        return "Clementine is not allowed to write there. Pick another output folder in Settings.".into();
+        return "Susen is not allowed to write there. Pick another output folder in Settings.".into();
     }
     let first = raw.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("Something went wrong");
     first.to_string()

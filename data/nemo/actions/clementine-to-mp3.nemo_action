@@ -1,8 +1,0 @@
-[Nemo Action]
-Name=Convert to MP3 (Clementine)
-Comment=Convert the selected audio or video to MP3
-Exec=clementine --convert mp3 --notify -- %F
-Icon-Name=io.github.sphanx.Clementine
-Selection=notnone
-Mimetypes=audio/*;video/*;
-Dependencies=clementine;

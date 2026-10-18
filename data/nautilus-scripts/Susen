@@ -1,9 +1,9 @@
 #!/bin/sh
-# Nautilus script: right-click > Scripts > Clementine opens the Convert wheel on the selection.
+# Nautilus script: right-click > Scripts > Susen opens the Convert wheel on the selection.
 # Use this when the nautilus-python extension is not available.
-# Install: cp Clementine ~/.local/share/nautilus/scripts/ && chmod +x ~/.local/share/nautilus/scripts/Clementine
-# Override the command with CLEMENTINE_COMMAND, e.g. "flatpak run io.github.sphanx.Clementine".
-cmd=${CLEMENTINE_COMMAND:-clementine}
+# Install: cp Susen ~/.local/share/nautilus/scripts/ && chmod +x ~/.local/share/nautilus/scripts/Susen
+# Override the command with SUSEN_COMMAND, e.g. "flatpak run io.github.sphanx.Susen".
+cmd=${SUSEN_COMMAND:-susen}
 if [ -n "$NAUTILUS_SCRIPT_SELECTED_FILE_PATHS" ]; then
     # One absolute path per line; the variable is empty for remote locations.
     # No globbing: a file named "*" must stay one file, not the whole folder.

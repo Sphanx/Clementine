@@ -1,0 +1,8 @@
+[Nemo Action]
+Name=Convert to MP4 (Susen)
+Comment=Convert the selected videos to MP4
+Exec=susen --convert mp4 --notify -- %F
+Icon-Name=io.github.sphanx.Susen
+Selection=notnone
+Mimetypes=video/*;
+Dependencies=susen;

@@ -1,4 +1,4 @@
-# Clementine
+# Susen
 
 A zero-click, offline file converter for Linux. Drag a file onto the window, tap a modifier,
 and drop it on a format. Inspired by [Tangerine](https://tangerineformac.com/) for Mac.
@@ -46,7 +46,7 @@ unsupported codec, password-protected PDF, damaged file); hover **Failed** for t
 **Settings** (the gear in the header bar) change which modifier opens which wheel (Shift, Ctrl, Alt or
 Super, each on one wheel only), whether results go next to the original or into one folder, and whether
 results are added to the shelf. Changes apply at once and are saved to
-`~/.config/clementine/config.json` (`$XDG_CONFIG_HOME` is honoured); a missing or broken file means defaults.
+`~/.config/susen/config.json` (`$XDG_CONFIG_HOME` is honoured); a missing or broken file means defaults.
 
 A slice is grey when a program it needs is missing; hover it to see which.
 
@@ -97,12 +97,12 @@ Rotate… needs qpdf.
 ## From the command line
 
 ```sh
-clementine --wheel FILE…               # the window, with the Convert wheel already open (keyboard)
-clementine --convert png FILE…         # convert, print each result's path
-clementine --tool compress FILE…       # run a tool, print each result's path
-clementine --tool trim --start 0:02 --end 0:10 clip.mp4
-clementine --list FILE…                # what the wheels offer for these files
-clementine --help
+susen --wheel FILE…               # the window, with the Convert wheel already open (keyboard)
+susen --convert png FILE…         # convert, print each result's path
+susen --tool compress FILE…       # run a tool, print each result's path
+susen --tool trim --start 0:02 --end 0:10 clip.mp4
+susen --list FILE…                # what the wheels offer for these files
+susen --help
 ```
 
 `--list` prints one option per line as `id<TAB>label`, e.g. `convert:png` tab `PNG`, or `tool:compress` tab `Compress`,
@@ -112,30 +112,30 @@ image, video, audio or PDF compression depending on the files, `rotate` turns an
 `--degrees` for a PDF, `split` splits a PDF into pages or audio/video by `--parts`/`--every`.
 
 Tools that ask for settings in the window (Trim…, Resize…, Crop…, Speed…, Split…, Fade…,
-Thumbnail…, Pages…, Rotate… for PDFs) take them as flags; `clementine --help` lists them. A flag left
+Thumbnail…, Pages…, Rotate… for PDFs) take them as flags; `susen --help` lists them. A flag left
 out keeps the dialog's default (resize 50%, split in 2, speed 2×…), and the values are checked the
 same way the dialog checks them. Results go where Settings say. `--notify` also reports the result
 as a desktop notification (through `notify-send`), which is how the file manager menus give feedback.
 Exit status: 0 on success, 1 when a conversion fails, 2 on a usage error. `--wheel` hands the files
-to a running Clementine when there is one.
+to a running Susen when there is one.
 
 ## File managers
 
-On Wayland nothing can float over every app the way Tangerine does on macOS, so Clementine lives in
+On Wayland nothing can float over every app the way Tangerine does on macOS, so Susen lives in
 the file manager's right-click menu instead. The .deb installs all of these; each does nothing
 unless its file manager is installed.
 
 | File manager | What you get | Installed to (.deb) | Needs |
 |---|---|---|---|
-| GNOME Files (Nautilus) | **Clementine ▸** Open in Clementine wheel…, Convert to ▸ (the wheel's formats), Tools ▸ | `/usr/share/nautilus-python/extensions/clementine.py` | `python3-nautilus` |
-| Caja (MATE) | the same menu, same file | `/usr/share/caja-python/extensions/clementine.py` | `python3-caja` |
-| Dolphin (KDE) | **Clementine ▸** Open in wheel, Zip, and per type: images → PNG/JPG/WEBP/PDF, audio → MP3/M4A/FLAC/WAV, video → MP4/WEBM/GIF/MP3, PDF → PNG/JPG/TXT, Compress | `/usr/share/kio/servicemenus/io.github.sphanx.Clementine*.desktop` | KDE Frameworks 6 |
-| Nemo (Cinnamon) | Open in Clementine wheel…, Convert to PNG/JPG/MP3/MP4, Compress | `/usr/share/nemo/actions/clementine-*.nemo_action` | — |
-| Thunar (Xfce) | custom actions in a Clementine submenu | not installable: see below | Thunar 4.18+ for the submenu |
-| GNOME Files, no python | Scripts ▸ Clementine opens the wheel | not installable: see below | — |
+| GNOME Files (Nautilus) | **Susen ▸** Open in Susen wheel…, Convert to ▸ (the wheel's formats), Tools ▸ | `/usr/share/nautilus-python/extensions/susen.py` | `python3-nautilus` |
+| Caja (MATE) | the same menu, same file | `/usr/share/caja-python/extensions/susen.py` | `python3-caja` |
+| Dolphin (KDE) | **Susen ▸** Open in wheel, Zip, and per type: images → PNG/JPG/WEBP/PDF, audio → MP3/M4A/FLAC/WAV, video → MP4/WEBM/GIF/MP3, PDF → PNG/JPG/TXT, Compress | `/usr/share/kio/servicemenus/io.github.sphanx.Susen*.desktop` | KDE Frameworks 6 |
+| Nemo (Cinnamon) | Open in Susen wheel…, Convert to PNG/JPG/MP3/MP4, Compress | `/usr/share/nemo/actions/susen-*.nemo_action` | — |
+| Thunar (Xfce) | custom actions in a Susen submenu | not installable: see below | Thunar 4.18+ for the submenu |
+| GNOME Files, no python | Scripts ▸ Susen opens the wheel | not installable: see below | — |
 
 Restart the file manager after installing (`nautilus -q`, `caja -q`, `nemo -q`); Dolphin picks the
-menus up when it next opens a menu. The Nautilus menu asks `clementine --list` for the selection, so it
+menus up when it next opens a menu. The Nautilus menu asks `susen --list` for the selection, so it
 always matches the wheel; Dolphin, Nemo and Thunar menus are fixed lists, and a choice that does not
 fit the selection (PNG on a PNG) ends in a "failed" notification.
 
@@ -144,10 +144,10 @@ fit the selection (PNG on a PNG) ends in a "failed" notification.
 ```sh
 # Nautilus extension (or ~/.local/share/caja-python/extensions/ for Caja)
 mkdir -p ~/.local/share/nautilus-python/extensions
-cp data/nautilus/clementine.py ~/.local/share/nautilus-python/extensions/
-# Nautilus script fallback: right-click > Scripts > Clementine
+cp data/nautilus/susen.py ~/.local/share/nautilus-python/extensions/
+# Nautilus script fallback: right-click > Scripts > Susen
 mkdir -p ~/.local/share/nautilus/scripts
-cp data/nautilus-scripts/Clementine ~/.local/share/nautilus/scripts/
+cp data/nautilus-scripts/Susen ~/.local/share/nautilus/scripts/
 # Dolphin: user service menus must be executable
 mkdir -p ~/.local/share/kio/servicemenus
 install -m 755 data/kio/servicemenus/*.desktop ~/.local/share/kio/servicemenus/
@@ -158,46 +158,46 @@ cp data/nemo/actions/*.nemo_action ~/.local/share/nemo/actions/
 
 **Thunar** keeps every custom action in one per-user file, `~/.config/Thunar/uca.xml`, so no package
 can add to it cleanly. Close Thunar (`thunar -q`) and paste the `<action>` elements from
-`data/thunar/uca.xml` (the .deb ships it as `/usr/share/clementine/thunar/uca.xml`) inside the
+`data/thunar/uca.xml` (the .deb ships it as `/usr/share/susen/thunar/uca.xml`) inside the
 `<actions>` element of yours, or re-create them in *Edit ▸ Configure custom actions…*.
 
 **Flatpak** cannot install anything into the host's file managers. Copy the files as above, then
 point them at the sandbox: the Nautilus/Caja extension and the Nautilus script read
-`CLEMENTINE_COMMAND` (and the extension falls back to `flatpak run io.github.sphanx.Clementine` by
-itself when no `clementine` is on `PATH`); in the Dolphin, Nemo and Thunar files replace
-`clementine ` in each `Exec=`/`<command>` with `flatpak run io.github.sphanx.Clementine `:
+`SUSEN_COMMAND` (and the extension falls back to `flatpak run io.github.sphanx.Susen` by
+itself when no `susen` is on `PATH`); in the Dolphin, Nemo and Thunar files replace
+`susen ` in each `Exec=`/`<command>` with `flatpak run io.github.sphanx.Susen `:
 
 ```sh
-sed -i 's|Exec=clementine |Exec=flatpak run io.github.sphanx.Clementine |' \
-    ~/.local/share/kio/servicemenus/io.github.sphanx.Clementine*.desktop \
-    ~/.local/share/nemo/actions/clementine-*.nemo_action
+sed -i 's|Exec=susen |Exec=flatpak run io.github.sphanx.Susen |' \
+    ~/.local/share/kio/servicemenus/io.github.sphanx.Susen*.desktop \
+    ~/.local/share/nemo/actions/susen-*.nemo_action
 ```
 
 The sandbox only sees your home folder, so files elsewhere cannot be converted from the Flatpak.
 
 ## Install
 
-**Debian / Ubuntu (.deb).** Download `clementine_*.deb` from the GitHub releases page, or build it
+**Debian / Ubuntu (.deb).** Download `susen_*.deb` from the GitHub releases page, or build it
 (see below), then:
 
 ```sh
-sudo apt install ./clementine_0.1.0-1_amd64.deb
+sudo apt install ./susen_0.1.0-1_amd64.deb
 ```
 
 apt pulls in GTK 4 and recommends the converters (ffmpeg, ImageMagick, pandoc, poppler-utils, zip,
 unzip). LibreOffice, unrar, p7zip, ghostscript and qpdf are suggested, not installed.
 
-**Flatpak.** The manifest is `flatpak/io.github.sphanx.Clementine.yml`; it is not on Flathub yet.
+**Flatpak.** The manifest is `flatpak/io.github.sphanx.Susen.yml`; it is not on Flathub yet.
 
 ```sh
 flatpak install --user flathub org.gnome.Platform//51 org.gnome.Sdk//51 \
     org.freedesktop.Sdk.Extension.rust-stable//26.08
-flatpak-builder --user --install --force-clean build-dir flatpak/io.github.sphanx.Clementine.yml
+flatpak-builder --user --install --force-clean build-dir flatpak/io.github.sphanx.Susen.yml
 ```
 
 The Flatpak bundles ffmpeg (with MP3 via lame), pandoc, zip, unzip and poppler-utils. It does **not**
 bundle ImageMagick, LibreOffice, unrar, p7zip, ghostscript or qpdf, so those conversions stay greyed out
-inside the sandbox. Clementine does not call host programs through `flatpak-spawn`.
+inside the sandbox. Susen does not call host programs through `flatpak-spawn`.
 
 **From source.** See *Building*.
 
@@ -207,7 +207,7 @@ inside the sandbox. Clementine does not call host programs through `flatpak-spaw
 # Debian / Ubuntu
 sudo apt install libgtk-4-dev ffmpeg imagemagick pandoc poppler-utils qpdf libreoffice zip unzip ghostscript
 cargo build --release
-./target/release/clementine [files…]
+./target/release/susen [files…]
 ```
 
 GTK 4.14 or newer. The converters are optional; install the ones you need.

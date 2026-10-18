@@ -1,10 +1,10 @@
 //! The command line: headless conversions for file managers and scripts.
 //!
 //! ```text
-//! clementine --convert png FILE…   convert, print each output path
-//! clementine --tool compress FILE… run a tool (compress, rotate, zip…), print each output path
-//! clementine --list FILE…          print what the wheels would offer, one option per line
-//! clementine --wheel FILE…         open the window with the files and the Convert wheel open
+//! susen --convert png FILE…   convert, print each output path
+//! susen --tool compress FILE… run a tool (compress, rotate, zip…), print each output path
+//! susen --list FILE…          print what the wheels would offer, one option per line
+//! susen --wheel FILE…         open the window with the files and the Convert wheel open
 //! ```
 //!
 //! These flags are read here, before GTK starts, so GApplication never sees them. Anything
@@ -12,7 +12,7 @@
 //!
 //! An option id is `convert:<ext>` or `tool:<name>`. A tool name is the same for every kind of
 //! file: `tool:compress` is CompressImage on a photo and CompressPdf on a PDF, so a file manager
-//! can ask for "compress" without knowing what Clementine calls it internally.
+//! can ask for "compress" without knowing what Susen calls it internally.
 
 use std::ffi::OsString;
 use std::io::IsTerminal;
@@ -29,11 +29,11 @@ pub const WHEEL_HINT: &str = "wheel";
 
 const USAGE: &str = "\
 Usage:
-  clementine [FILE…]                 open the window, files on the shelf
-  clementine --wheel FILE…           open the window with the Convert wheel open
-  clementine --convert FORMAT FILE…  convert (e.g. png, mp3, pdf) and print the results
-  clementine --tool TOOL FILE…       run a tool and print the results
-  clementine --list FILE…            print the options for these files, one per line
+  susen [FILE…]                 open the window, files on the shelf
+  susen --wheel FILE…           open the window with the Convert wheel open
+  susen --convert FORMAT FILE…  convert (e.g. png, mp3, pdf) and print the results
+  susen --tool TOOL FILE…       run a tool and print the results
+  susen --list FILE…            print the options for these files, one per line
 
 Tools (each only where it applies): compress, resize, crop, rotate, strip-metadata, half-size,
 mute, thumbnail, normalize, mono, fade, trim, split, speed, merge, pages, extract, zip.
@@ -68,7 +68,7 @@ pub enum Command {
 
 /// What `main` does next.
 pub enum Next {
-    /// Not a Clementine flag: start the GUI with the arguments as they are.
+    /// Not a Susen flag: start the GUI with the arguments as they are.
     Gui,
     /// Start the GUI with these files and open the Convert wheel.
     Wheel(Vec<PathBuf>),
@@ -84,7 +84,7 @@ pub fn parse(args: &[OsString]) -> Result<Option<Command>, String> {
     let mut settings: Vec<(String, String)> = Vec::new();
     let mut only_files = false;
     let mut it = args.iter();
-    // A Clementine flag must come first, so `clementine --convert.png` (a file) still opens the GUI.
+    // A Susen flag must come first, so `susen --convert.png` (a file) still opens the GUI.
     let Some(first) = args.first().and_then(|a| a.to_str()) else { return Ok(None) };
     if !is_ours(first) {
         return Ok(None);
@@ -338,7 +338,7 @@ pub fn main_hook() -> Next {
         Ok(None) => Next::Gui,
         Ok(Some(cmd)) => run(cmd),
         Err(e) => {
-            eprintln!("clementine: {e}\n\n{USAGE}");
+            eprintln!("susen: {e}\n\n{USAGE}");
             Next::Exit(2)
         }
     }
@@ -367,9 +367,9 @@ fn run(cmd: Command) -> Next {
     };
     let files = absolute(files);
     let fail = |msg: String| {
-        eprintln!("clementine: {msg}");
+        eprintln!("susen: {msg}");
         if notify {
-            notify_send("Clementine: failed", &msg);
+            notify_send("Susen: failed", &msg);
         }
         Next::Exit(1)
     };
@@ -395,7 +395,7 @@ fn run(cmd: Command) -> Next {
             }
             if notify {
                 let names: Vec<String> = outputs.iter().map(|o| display_name(o)).collect();
-                notify_send(&format!("Clementine: {}", op.label()), &names.join("\n"));
+                notify_send(&format!("Susen: {}", op.label()), &names.join("\n"));
             }
             Next::Exit(0)
         }
@@ -409,7 +409,7 @@ fn display_name(path: &Path) -> String {
 
 /// Best effort: a file manager runs us without a terminal, so this is the only feedback there.
 fn notify_send(summary: &str, body: &str) {
-    if std::io::stderr().is_terminal() && std::env::var_os("CLEMENTINE_FORCE_NOTIFY").is_none() {
+    if std::io::stderr().is_terminal() && std::env::var_os("SUSEN_FORCE_NOTIFY").is_none() {
         return;
     }
     let _ = Process::new("notify-send").args(notify_args(summary, body)).status();
@@ -418,7 +418,7 @@ fn notify_send(summary: &str, body: &str) {
 /// `notify-send`'s arguments. File names and tool errors come from untrusted files, so `--` ends
 /// the options: a name like `--action=…` is shown, never parsed.
 fn notify_args<'a>(summary: &'a str, body: &'a str) -> [&'a str; 5] {
-    ["--app-name=Clementine", "--icon=io.github.sphanx.Clementine", "--", summary, body]
+    ["--app-name=Susen", "--icon=io.github.sphanx.Susen", "--", summary, body]
 }
 
 #[cfg(test)]

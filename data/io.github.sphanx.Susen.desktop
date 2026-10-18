@@ -1,10 +1,10 @@
 [Desktop Entry]
 Type=Application
-Name=Clementine
+Name=Susen
 GenericName=File Converter
 Comment=Drag a file in, tap a modifier, drop it on a format
-Exec=clementine %F
-Icon=io.github.sphanx.Clementine
+Exec=susen %F
+Icon=io.github.sphanx.Susen
 Terminal=false
 Categories=Utility;GTK;
 Keywords=convert;converter;image;video;audio;pdf;compress;

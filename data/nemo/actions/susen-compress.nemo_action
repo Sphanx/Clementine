@@ -1,8 +1,8 @@
 [Nemo Action]
-Name=Compress (Clementine)
+Name=Compress (Susen)
 Comment=Make the selected images, audio, video or PDFs smaller
-Exec=clementine --tool compress --notify -- %F
-Icon-Name=io.github.sphanx.Clementine
+Exec=susen --tool compress --notify -- %F
+Icon-Name=io.github.sphanx.Susen
 Selection=notnone
 Mimetypes=image/*;audio/*;video/*;application/pdf;
-Dependencies=clementine;
+Dependencies=susen;
