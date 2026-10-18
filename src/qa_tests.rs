@@ -298,8 +298,7 @@ fn looks_valid(out: &Path) -> Result<(), String> {
         return Err(format!("{} is empty", out.display()));
     }
     let ok = match kind_of(out) {
-        // `image_size` hands the name to ImageMagick, which reads `%d` in it as a pattern
-        // (see `bug_percent_names_are_taken_literally`); the bytes on stdin are checked instead.
+        // `image_size` reads a name with `%` or glob characters through a safely named link.
         Kind::Image => image_size(out).is_some() || image_on_stdin(out),
         Kind::Audio | Kind::Video => media_duration(out).is_some(),
         Kind::Pdf => pdf_page_count(out).is_some_and(|n| n > 0),
@@ -655,7 +654,6 @@ fn more_samples(dir: &Path) -> Vec<PathBuf> {
 fn known_bug(file: &Path, op: Op) -> Option<&'static str> {
     let name = file.file_name()?.to_str()?;
     match (name, op) {
-        ("i_multi.tiff", Op::Tool(Tool::Resize)) => Some("bug_resize_on_animations_and_multi_page_images"),
         ("a_wma.wma", Op::Tool(Tool::NormalizeAudio)) => Some("bug_normalize_wma"),
         ("v_avi.avi" | "v_wmv.wmv" | "v_mpg.mpg" | "v_flv.flv", Op::Tool(Tool::Speed)) => {
             Some("bug_speed_on_avi_wmv_mpg_flv")
@@ -881,8 +879,8 @@ fn qa_upper_case_extensions_work() {
 }
 
 #[test]
-#[ignore = "BUG: ImageMagick, pdfseparate and ffmpeg's image writer expand % patterns in output names"]
-fn bug_percent_names_are_taken_literally() {
+#[ignore = "slow: runs the converters"]
+fn qa_percent_names_are_taken_literally() {
     let failures = hostile_failures(PERCENT, false);
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
@@ -1130,13 +1128,12 @@ fn qa_wrong_extension_with_real_content_fails_cleanly() {
     }
 }
 
-/// `*` and `?` in an image's name: with the decoder pinned (`png:/a/b*.png`), ImageMagick no longer
-/// checks for the literal file first and globs, so siblings matching the pattern are read too.
-/// The result is a multi-frame write to `name-0.png`, `name-1.png`…, reported as `name.png`,
-/// which does not exist.
+/// Regression: `*` and `?` in an image's name. With the decoder pinned (`png:/a/b*.png`),
+/// ImageMagick globs, so siblings matching the pattern were read too and written as `name-0.png`,
+/// `name-1.png`…, reported as `name.png`. Such inputs are now read through a safely named link.
 #[test]
-#[ignore = "BUG: image names with * or ? read every sibling the pattern matches"]
-fn bug_glob_characters_in_image_names() {
+#[ignore = "slow: runs the converters"]
+fn qa_glob_characters_in_image_names() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     sh(d, im(), &["-size", "64x48", "xc:red", "star*?.png"]);
@@ -1323,12 +1320,12 @@ fn expect_all_work(cases: Vec<(PathBuf, Op)>, dir: &Path) {
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
 
-/// Resize… at its default 50% on an animated GIF or a multi-page TIFF: ImageMagick reads the `%`
-/// in `name (50%).gif` as a frame pattern and writes `name (50%)-0.gif`, and the run reports
-/// success with an output that does not exist.
+/// Regression: Resize… at its default 50% on an animated GIF or a multi-page TIFF. ImageMagick
+/// read the `%` in `name (50%).gif` as a frame pattern and wrote `name (50%)-0.gif`. It now writes
+/// a safe scratch name that is moved into place, and the animation stays one animated file.
 #[test]
-#[ignore = "BUG: Resize 50% on a GIF animation or multi-page TIFF reports a file that does not exist"]
-fn bug_resize_on_animations_and_multi_page_images() {
+#[ignore = "slow: runs the converters"]
+fn qa_resize_on_animations_and_multi_page_images() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     sh(d, im(), &["-size", "64x48", "xc:red", "xc:blue", "-set", "delay", "20", "anim.gif"]);
@@ -1337,6 +1334,11 @@ fn bug_resize_on_animations_and_multi_page_images() {
         vec![(d.join("anim.gif"), Op::Tool(Tool::Resize)), (d.join("pages.tiff"), Op::Tool(Tool::Resize))],
         d,
     );
+    for out in ["anim (50%).gif", "pages (50%).tiff"] {
+        let file = std::fs::File::open(d.join(out)).unwrap();
+        let frames = Command::new(im()).args(["-", "-format", "%w\\n", "info:"]).stdin(file).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&frames.stdout).lines().collect::<Vec<_>>(), ["32", "32"], "{out}");
+    }
 }
 
 /// Normalize: `loudnorm` outputs 192 kHz, which the WMA encoder refuses (no `-ar` is given).

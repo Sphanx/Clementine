@@ -25,6 +25,7 @@ long time, and Cancel is the remedy), and other processes running as the same us
 | Archive symlink pointing outside (left in the output, or followed later) | After extraction the folder is walked without following links. A link that is absolute or resolves outside is removed, and so are device and pipe nodes. tar runs with `--no-same-owner --no-same-permissions`. | `extracting_drops_links_that_point_outside`, `seven_zip_links_never_survive` |
 | Archive → archive packing a linked local file (e.g. a key) into the new archive | Repacking uses `zip -y` (links stay links); tar never follows. | `repacking_never_copies_a_linked_file_in` |
 | Image content choosing the decoder (an SVG named `.png`) | Every ImageMagick input is written `coder:/abs/path`, with the coder taken from the extension. | `image_content_cannot_choose_the_decoder` |
+| A name read as a pattern: ImageMagick globs `*`, `?`, `[…]` in an input (with the coder pinned it reads every matching sibling) and expands `%d` in input and output names; pdfseparate expands `%` too | An image input whose name has `*?[]{}%` is read through a symlink with a safe name in scratch (keeping the extension, so the coder is unchanged). ImageMagick, pdftoppm and pdfseparate always write safe names in scratch, which are then moved onto the reserved output. Every reported output must exist and be non-empty, so a mismatch fails the job instead of passing silently. | `qa_tests::qa_glob_characters_in_image_names`, `qa_tests::qa_percent_names_are_taken_literally` (ignored, slow) |
 | ImageMagick scripting and file-reading coders (`msl:`, `text:`, `@list`, URL, PostScript via Ghostscript) | Bundled `data/imagemagick/policy.xml`, loaded through `MAGICK_CONFIGURE_PATH` on top of the system policy. | `magick_refuses_script_and_text_coders`, `svg_cannot_read_local_files_through_coders` |
 | Disguised HLS playlist or concat list making ffmpeg fetch URLs | `-protocol_whitelist file` on every ffmpeg and ffprobe input. | `media_playlists_cannot_reach_the_network` |
 | Document naming local images (`![](/home/…)`) or remote ones, embedded by pandoc | `--sandbox` when a probe shows it works. pandoc 3.1.3 cannot read its own DOCX/ODT/EPUB templates in the sandbox, so otherwise `data/pandoc/local-only.lua` drops images with a URL scheme, an absolute path, `~` or `..`. | `documents_cannot_embed_local_files` |
@@ -37,7 +38,7 @@ long time, and Cancel is the remedy), and other processes running as the same us
 
 Scratch files go in a fresh `0700` folder from `tempfile`, removed when the job ends, whether it
 succeeds or fails. A failed job removes the outputs it claimed. Every reported output is checked to exist and be
-non-empty (a file) or non-empty (a folder) before the job counts as done. Outputs are created
+non-empty (a file with bytes in it, or a folder with something in it) before the job counts as done. Outputs are created
 with the user's umask.
 
 The Flatpak has no network access (`--share=network` is not granted), so even a converter bug

@@ -60,6 +60,19 @@ pub enum Step {
     CheckArchive(PathBuf),
     /// Removes what an extraction left in this folder that leads outside it (see [`confine`]).
     Confine(PathBuf),
+    /// A symlink `to` → `from`, giving an input a name no program reads as a pattern.
+    Link {
+        from: PathBuf,
+        to: PathBuf,
+    },
+    /// Moves every file in the scratch folder `from` into `to`, renaming `{prefix}rest` to
+    /// `{stem}rest`: page files written under a safe name get their real one.
+    Collect {
+        from: PathBuf,
+        to: PathBuf,
+        prefix: String,
+        stem: String,
+    },
 }
 
 /// The steps for one output (or one group of outputs) and what they produce.
@@ -202,6 +215,33 @@ fn im_input(path: &Path, frame: &str) -> OsString {
     s.push(path.as_os_str());
     s.push(frame);
     s
+}
+
+/// Whether ImageMagick could read `path`'s name as something other than one literal file: with
+/// an explicit coder it globs `*`, `?` and `[…]`, and reads `%d`-style patterns as frame numbers.
+fn im_unsafe_name(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    path.file_name().is_some_and(|n| n.as_bytes().iter().any(|b| b"*?[]{}%".contains(b)))
+}
+
+/// One ImageMagick run on `input` into `out`. The input is read through a symlink with a safe
+/// name when its own name has pattern characters, and the result is written under a safe name in
+/// scratch and then moved onto `out`, so neither name is ever expanded. A multi-frame result
+/// stays in one file (GIF, TIFF and WebP hold frames); any other spread is caught by the move.
+fn magick_steps(steps: &mut Vec<Step>, input: &Path, frame: &str, args: &[OsString], out: &Path, scratch: &Path) {
+    let src = if im_unsafe_name(input) {
+        let link = scratch_file(scratch, &extension(input));
+        steps.push(Step::Link { from: input.to_path_buf(), to: link.clone() });
+        link
+    } else {
+        input.to_path_buf()
+    };
+    let ext = out.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let tmp = scratch_file(scratch, &ext);
+    // The decoder still comes from the real input's extension (the link has the same one).
+    let cmd = Cmd::new(magick()).arg(im_input(&src, frame)).args(args.iter().cloned()).arg(&tmp);
+    steps.push(Step::Run(cmd));
+    steps.push(Step::Move { from: tmp, to: out.to_path_buf() });
 }
 
 /// A folder holding Susen's `policy.xml`, for `MAGICK_CONFIGURE_PATH`. Written once per run
@@ -422,10 +462,14 @@ fn soffice_to(steps: &mut Vec<Step>, input: &Path, convert_to: &str, produced_ex
 }
 
 /// Renders every page of a PDF into a fresh folder, 300 DPI.
-fn pdf_pages(steps: &mut Vec<Step>, pdf: &Path, image: &str, dir: &Path, name: &str) {
+/// The pages are rendered under a safe name in scratch, then moved in as `name-1.png`….
+fn pdf_pages(steps: &mut Vec<Step>, pdf: &Path, image: &str, dir: &Path, name: &str, scratch: &Path) {
     steps.push(Step::MkDir(dir.to_path_buf()));
+    let tmp = scratch_file(scratch, "");
+    steps.push(Step::MkDir(tmp.clone()));
     let format = if image == "png" { "-png" } else { "-jpeg" };
-    steps.push(Step::Run(Cmd::new("pdftoppm").args(["-r", "300", format]).arg(pdf).arg(dir.join(name))));
+    steps.push(Step::Run(Cmd::new("pdftoppm").args(["-r", "300", format]).arg(pdf).arg(tmp.join("p"))));
+    steps.push(Step::Collect { from: tmp, to: dir.to_path_buf(), prefix: "p".into(), stem: name.into() });
 }
 
 /// Unpacks `input` into the empty folder `dest`, never outside it: entry names are checked before
@@ -545,9 +589,9 @@ fn convert_job(input: &Path, target: &'static str, scratch: &Path, names: &mut N
 
     match kind {
         Kind::Image => {
-            // Only the first frame of an animation or layered file becomes a still.
-            let frame = if matches!(src.as_str(), "gif" | "tiff") && target != src { "[0]" } else { "" };
-            steps.push(Step::Run(Cmd::new(magick()).arg(im_input(input, frame)).arg("-auto-orient").arg(&out)));
+            // Only the first frame of an animation, a multi-page or a layered file becomes a still.
+            let frame = if target != src { "[0]" } else { "" };
+            magick_steps(&mut steps, input, frame, &["-auto-orient".into()], &out, scratch);
         }
         Kind::Audio | Kind::Video => {
             steps.push(Step::Run(ffmpeg(input).args(ffmpeg_codec(target).iter().copied()).arg(&out)));
@@ -556,7 +600,7 @@ fn convert_job(input: &Path, target: &'static str, scratch: &Path, names: &mut N
         Kind::Subtitle => steps.push(Step::Run(ffmpeg(input).arg(&out))),
         Kind::Pdf => match target {
             "png" | "jpg" => {
-                pdf_pages(&mut steps, input, target, &out, &name);
+                pdf_pages(&mut steps, input, target, &out, &name, scratch);
             }
             "txt" => steps.push(Step::Run(Cmd::new("pdftotext").arg("-layout").arg(input).arg(&out))),
             _ => soffice_to(&mut steps, input, target, target, scratch, out.clone()),
@@ -592,7 +636,7 @@ fn convert_job(input: &Path, target: &'static str, scratch: &Path, names: &mut N
             "png" | "jpg" => {
                 let pdf = scratch.join(format!("{name}.pdf"));
                 soffice_to(&mut steps, input, "pdf", "pdf", scratch, pdf.clone());
-                pdf_pages(&mut steps, &pdf, target, &out, &name);
+                pdf_pages(&mut steps, &pdf, target, &out, &name, scratch);
             }
             _ => soffice_to(&mut steps, input, target, target, scratch, out.clone()),
         },
@@ -693,14 +737,25 @@ fn tool_job(input: &Path, tool: Tool, setup: &Setup, names: &mut Names) -> Resul
     let name = stem(input);
     let ext = extension(input);
     let mut steps = Vec::new();
-    let im = |out: &Path, args: &[&str]| {
-        Step::Run(Cmd::new(magick()).arg(im_input(input, "")).arg("-auto-orient").args(args.iter().copied()).arg(out))
+    // An animated GIF is coalesced into whole frames first, or resizing, cropping or turning its
+    // optimised partial frames goes wrong; it is optimised again on the way out.
+    let gif = canonical(&ext) == "gif";
+    let im = |steps: &mut Vec<Step>, out: &Path, args: &[&str], frames: bool| {
+        let mut all: Vec<OsString> = vec!["-auto-orient".into()];
+        if frames && gif {
+            all.push("-coalesce".into());
+        }
+        all.extend(args.iter().map(OsString::from));
+        if frames && gif {
+            all.extend(["-layers".into(), "optimize".into()]);
+        }
+        magick_steps(steps, input, "", &all, out, setup.scratch);
     };
     let out = match tool {
         Tool::CompressImage => {
             let out = names.claim(&dir, &format!("{name} (compressed)"), &ext)?;
             let extra: &[&str] = if ext == "png" { &["-define", "png:compression-level=9"] } else { &[] };
-            steps.push(im(&out, &[&["-strip", "-quality", "75"], extra].concat()));
+            im(&mut steps, &out, &[&["-strip", "-quality", "75"], extra].concat(), false);
             out
         }
         Tool::Resize => {
@@ -712,7 +767,7 @@ fn tool_job(input: &Path, tool: Tool, setup: &Setup, names: &mut Names) -> Resul
                 _ => bail!("Resize needs a size"),
             };
             let out = names.claim(&dir, &format!("{name} ({label})"), &ext)?;
-            steps.push(im(&out, &["-resize", &geometry]));
+            im(&mut steps, &out, &["-resize", &geometry], true);
             out
         }
         Tool::CropImage => {
@@ -723,17 +778,17 @@ fn tool_job(input: &Path, tool: Tool, setup: &Setup, names: &mut Names) -> Resul
                 _ => bail!("Crop needs a size"),
             };
             let out = names.claim(&dir, &format!("{name} (cropped)"), &ext)?;
-            steps.push(im(&out, &["-gravity", gravity, "-crop", &geometry, "+repage"]));
+            im(&mut steps, &out, &["-gravity", gravity, "-crop", &geometry, "+repage"], true);
             out
         }
         Tool::Rotate90 => {
             let out = names.claim(&dir, &format!("{name} (rotated)"), &ext)?;
-            steps.push(im(&out, &["-rotate", "90"]));
+            im(&mut steps, &out, &["-rotate", "90"], true);
             out
         }
         Tool::StripMetadata => {
             let out = names.claim(&dir, &format!("{name} (clean)"), &ext)?;
-            steps.push(im(&out, &["-strip"]));
+            im(&mut steps, &out, &["-strip"], false);
             out
         }
         Tool::CompressVideo => {
@@ -846,7 +901,7 @@ fn tool_job(input: &Path, tool: Tool, setup: &Setup, names: &mut Names) -> Resul
                 steps.push(Step::Run(cmd.arg(format!("{first}-{last}")).arg("--").arg(&out)));
             } else {
                 // poppler: one file per page, then joined back together.
-                let pages = setup.scratch.join(format!("pages-{name}"));
+                let pages = scratch_file(setup.scratch, "");
                 steps.push(Step::MkDir(pages.clone()));
                 let separate = Cmd::new("pdfseparate").arg("-f").arg(first.to_string()).arg("-l").arg(last.to_string());
                 steps.push(Step::Run(separate.arg(input).arg(pages.join("p-%d.pdf"))));
@@ -877,7 +932,11 @@ fn tool_job(input: &Path, tool: Tool, setup: &Setup, names: &mut Names) -> Resul
         Tool::SplitPdf => {
             let out = names.claim(&dir, &format!("{name} (pages)"), "")?;
             steps.push(Step::MkDir(out.clone()));
-            steps.push(Step::Run(Cmd::new("pdfseparate").arg(input).arg(out.join(format!("{name}-%d.pdf")))));
+            // pdfseparate reads `%` in the whole pattern, so it writes `p-%d.pdf` in scratch.
+            let tmp = scratch_file(setup.scratch, "");
+            steps.push(Step::MkDir(tmp.clone()));
+            steps.push(Step::Run(Cmd::new("pdfseparate").arg(input).arg(tmp.join("p-%d.pdf"))));
+            steps.push(Step::Collect { from: tmp, to: out.clone(), prefix: "p".into(), stem: name.clone() });
             out
         }
         Tool::Extract => {
@@ -1117,12 +1176,22 @@ fn run_step(step: &Step, ctx: &Ctx) -> Result<()> {
         Step::MkDir(dir) => Ok(std::fs::create_dir_all(dir)?),
         Step::Move { from, to } => {
             if !from.exists() {
-                bail!("the converter produced no {}", from.file_name().unwrap_or_default().to_string_lossy());
+                bail!("the converter produced no {}", to.file_name().unwrap_or_default().to_string_lossy());
             }
-            if std::fs::rename(from, to).is_err() {
-                // Scratch and destination may sit on different file systems.
-                std::fs::copy(from, to)?;
-                std::fs::remove_file(from)?;
+            move_file(from, to)
+        }
+        Step::Link { from, to } => {
+            std::os::unix::fs::symlink(from, to).with_context(|| format!("linking {}", from.display()))
+        }
+        Step::Collect { from, to, prefix, stem } => {
+            use std::os::unix::ffi::OsStrExt;
+            for entry in std::fs::read_dir(from)? {
+                let path = entry?.path();
+                let name = path.file_name().unwrap_or_default().as_bytes();
+                let Some(rest) = name.strip_prefix(prefix.as_bytes()) else { continue };
+                let mut new = OsString::from(stem);
+                new.push(OsStr::from_bytes(rest));
+                move_file(&path, &to.join(new))?;
             }
             Ok(())
         }
@@ -1136,6 +1205,15 @@ fn run_step(step: &Step, ctx: &Ctx) -> Result<()> {
         },
         Step::Confine(dir) => confine(dir),
     }
+}
+
+/// Renames `from` to `to`, or copies it when they sit on different file systems.
+fn move_file(from: &Path, to: &Path) -> Result<()> {
+    if std::fs::rename(from, to).is_err() {
+        std::fs::copy(from, to).with_context(|| format!("writing {}", to.display()))?;
+        std::fs::remove_file(from)?;
+    }
+    Ok(())
 }
 
 /// Whether a step does work worth counting in [`Progress`]; folders and moves are instant.
@@ -1251,6 +1329,16 @@ pub fn media_duration(path: &Path) -> Option<f64> {
 
 /// An image's width and height as the tools see it: first frame, upright.
 pub fn image_size(path: &Path) -> Option<(u32, u32)> {
+    // A name ImageMagick would expand is read through a safely named link.
+    let alias = if im_unsafe_name(path) {
+        let dir = tempfile::Builder::new().prefix("susen-size-").tempdir().ok()?;
+        let link = dir.path().join(format!("i.{}", extension(path)));
+        std::os::unix::fs::symlink(std::path::absolute(path).ok()?, &link).ok()?;
+        Some((dir, link))
+    } else {
+        None
+    };
+    let path = alias.as_ref().map_or(path, |(_, link)| link.as_path());
     let first = im_input(path, "[0]");
     let args = [
         first.as_os_str(),
