@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Clementine
+GenericName=File Converter
+Comment=Drag a file in, tap a modifier, drop it on a format
+Exec=clementine %F
+Icon=document-send
+Terminal=false
+Categories=Utility;GTK;
+Keywords=convert;converter;image;video;audio;pdf;compress;
+MimeType=image/png;image/jpeg;image/webp;image/heic;image/avif;image/tiff;image/gif;image/bmp;image/svg+xml;audio/mpeg;audio/x-wav;audio/flac;audio/ogg;audio/mp4;video/mp4;video/quicktime;video/x-matroska;video/webm;video/x-msvideo;application/pdf;application/vnd.openxmlformats-officedocument.wordprocessingml.document;application/vnd.oasis.opendocument.text;application/rtf;text/markdown;text/plain;text/html;application/epub+zip;application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;application/vnd.ms-excel;application/vnd.oasis.opendocument.spreadsheet;text/csv;application/vnd.openxmlformats-officedocument.presentationml.presentation;application/vnd.ms-powerpoint;application/vnd.oasis.opendocument.presentation;application/x-subrip;text/vtt;application/zip;application/x-tar;application/gzip;application/vnd.rar;application/x-7z-compressed;

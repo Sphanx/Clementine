@@ -1,0 +1,21 @@
+name: CI
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GTK and the converters
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev ffmpeg imagemagick pandoc poppler-utils zip unzip ghostscript
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      # Every conversion on real files; LibreOffice ops are skipped here (not installed).
+      - run: cargo test -- --ignored --nocapture

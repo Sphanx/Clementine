@@ -1,0 +1,9 @@
+[package]
+name = "clementine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+gtk = { version = "0.11", package = "gtk4", features = ["v4_14"] }
+tempfile = "3.27.0"
