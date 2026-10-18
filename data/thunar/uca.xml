@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Clementine custom actions for Thunar.
+
+  Thunar keeps every custom action in one per-user file, ~/.config/Thunar/uca.xml, so a package
+  cannot add to it cleanly. Either add these through Edit > Configure custom actions… (copy the
+  name, command and file types below), or paste the <action> elements inside the <actions>
+  element of ~/.config/Thunar/uca.xml while Thunar is closed (thunar -q).
+
+  %F is the selected files. Replace `clementine` with `flatpak run io.github.sphanx.Clementine`
+  for the Flatpak.
+-->
+<actions>
+<action>
+	<icon>io.github.sphanx.Clementine</icon>
+	<name>Open in Clementine wheel…</name>
+	<submenu>Clementine</submenu>
+	<unique-id>clementine-wheel</unique-id>
+	<command>clementine --wheel -- %F</command>
+	<description>Choose a conversion on the Clementine wheel</description>
+	<range>*</range>
+	<patterns>*</patterns>
+	<other-files/>
+	<image-files/>
+	<audio-files/>
+	<video-files/>
+	<text-files/>
+</action>
+<action>
+	<icon>io.github.sphanx.Clementine</icon>
+	<name>Convert to PNG</name>
+	<submenu>Clementine</submenu>
+	<unique-id>clementine-to-png</unique-id>
+	<command>clementine --convert png --notify -- %F</command>
+	<description>Convert the selected images to PNG</description>
+	<range>*</range>
+	<patterns>*</patterns>
+	<image-files/>
+</action>
+<action>
+	<icon>io.github.sphanx.Clementine</icon>
+	<name>Convert to JPG</name>
+	<submenu>Clementine</submenu>
+	<unique-id>clementine-to-jpg</unique-id>
+	<command>clementine --convert jpg --notify -- %F</command>
+	<description>Convert the selected images to JPG</description>
+	<range>*</range>
+	<patterns>*</patterns>
+	<image-files/>
+</action>
+<action>
+	<icon>io.github.sphanx.Clementine</icon>
+	<name>Convert to MP3</name>
+	<submenu>Clementine</submenu>
+	<unique-id>clementine-to-mp3</unique-id>
+	<command>clementine --convert mp3 --notify -- %F</command>
+	<description>Convert the selected audio or video to MP3</description>
+	<range>*</range>
+	<patterns>*</patterns>
+	<audio-files/>
+	<video-files/>
+</action>
+<action>
+	<icon>io.github.sphanx.Clementine</icon>
+	<name>Convert to MP4</name>
+	<submenu>Clementine</submenu>
+	<unique-id>clementine-to-mp4</unique-id>
+	<command>clementine --convert mp4 --notify -- %F</command>
+	<description>Convert the selected videos to MP4</description>
+	<range>*</range>
+	<patterns>*</patterns>
+	<video-files/>
+</action>
+<action>
+	<icon>io.github.sphanx.Clementine</icon>
+	<name>Compress</name>
+	<submenu>Clementine</submenu>
+	<unique-id>clementine-compress</unique-id>
+	<command>clementine --tool compress --notify -- %F</command>
+	<description>Make the selected images, audio, video or PDFs smaller</description>
+	<range>*</range>
+	<patterns>*.pdf;*.PDF</patterns>
+	<image-files/>
+	<audio-files/>
+	<video-files/>
+</action>
+</actions>
