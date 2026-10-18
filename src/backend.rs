@@ -48,8 +48,18 @@ impl Cmd {
 pub enum Step {
     Run(Cmd),
     MkDir(PathBuf),
-    Move { from: PathBuf, to: PathBuf },
-    SubtitleToText { from: PathBuf, to: PathBuf },
+    Move {
+        from: PathBuf,
+        to: PathBuf,
+    },
+    SubtitleToText {
+        from: PathBuf,
+        to: PathBuf,
+    },
+    /// Refuses an archive with an entry named outside the folder it unpacks into.
+    CheckArchive(PathBuf),
+    /// Removes what an extraction left in this folder that leads outside it (see [`confine`]).
+    Confine(PathBuf),
 }
 
 /// The steps for one output (or one group of outputs) and what they produce.
@@ -75,7 +85,8 @@ impl Names {
             let base = if n == 1 { stem.to_string() } else { format!("{stem} ({n})") };
             let name = if ext.is_empty() { base } else { format!("{base}.{ext}") };
             let path = dir.join(name);
-            if !path.exists() && !self.taken.contains(&path) {
+            // `symlink_metadata`: a dangling link is taken too, or a converter would write through it.
+            if std::fs::symlink_metadata(&path).is_err() && !self.taken.contains(&path) {
                 self.taken.insert(path.clone());
                 return path;
             }
@@ -110,6 +121,43 @@ fn magick() -> &'static str {
     if has_program("magick") { "magick" } else { "convert" }
 }
 
+/// ImageMagick's name for an input, with its decoder fixed by the extension (`png:/a/b.png`), so
+/// the content of an untrusted file can never pick a different parser. `frame` is `""` or `"[0]"`.
+fn im_input(path: &Path, frame: &str) -> OsString {
+    let ext = extension(path);
+    let coder = match canonical(&ext) {
+        "jpg" => "jpeg",
+        other => other,
+    };
+    let mut s = OsString::from(format!("{coder}:"));
+    s.push(path.as_os_str());
+    s.push(frame);
+    s
+}
+
+/// A folder holding Clementine's `policy.xml`, for `MAGICK_CONFIGURE_PATH`. Written once per run
+/// of the app into a private temporary folder.
+fn magick_policy_dir() -> Option<&'static Path> {
+    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = tempfile::Builder::new().prefix("clementine-magick-").tempdir().ok()?;
+        std::fs::write(dir.path().join("policy.xml"), include_str!("../data/imagemagick/policy.xml")).ok()?;
+        Some(dir.keep())
+    })
+    .as_deref()
+}
+
+/// A [`Command`] for `program`; ImageMagick also gets Clementine's restrictive policy.
+fn command(program: &str) -> Command {
+    let mut c = Command::new(program);
+    if matches!(program, "magick" | "convert")
+        && let Some(dir) = magick_policy_dir()
+    {
+        c.env("MAGICK_CONFIGURE_PATH", dir);
+    }
+    c
+}
+
 fn ffmpeg(input: &Path) -> Cmd {
     ffmpeg_from(input, 0.0)
 }
@@ -121,7 +169,8 @@ fn ffmpeg_from(input: &Path, start: f64) -> Cmd {
     if start > 0.0 {
         cmd = cmd.arg("-ss").arg(trim_number(start));
     }
-    cmd.arg("-i").arg(input)
+    // Only plain local files: a disguised playlist or subtitle cannot make ffmpeg fetch URLs.
+    cmd.args(["-protocol_whitelist", "file"]).arg("-i").arg(input)
 }
 
 const X264_HQ: &[&str] =
@@ -198,11 +247,7 @@ fn ffmpeg_codec(target: &str) -> &'static [&'static str] {
 /// LibreOffice's profile lives in the user's cache, so it starts warm after the first run.
 /// Two instances on one profile fight, so LibreOffice calls are serialised by [`LO_LOCK`].
 fn soffice(input: &Path, convert_to: &str, outdir: &Path, infilter: Option<&str>) -> Cmd {
-    let cache = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .unwrap_or_else(std::env::temp_dir);
-    let profile = cache.join("clementine").join("libreoffice");
+    let profile = lo_profile();
     let mut cmd = Cmd::new("soffice")
         .arg(format!("-env:UserInstallation=file://{}", profile.display()))
         .args(["--headless", "--norestore"]);
@@ -213,6 +258,54 @@ fn soffice(input: &Path, convert_to: &str, outdir: &Path, infilter: Option<&str>
 }
 
 static LO_LOCK: Mutex<()> = Mutex::new(());
+
+fn lo_profile() -> PathBuf {
+    let cache = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir);
+    cache.join("clementine").join("libreoffice")
+}
+
+/// Settings pinned in Clementine's own LibreOffice profile: documents are untrusted, so their
+/// macros never run, whatever the profile was changed to.
+const LO_LOCKDOWN: &str = r#"<item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="MacroSecurityLevel" oor:op="fuse"><value>3</value></prop></item>
+<item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="DisableMacrosExecution" oor:op="fuse"><value>true</value></prop></item>
+"#;
+
+/// Writes [`LO_LOCKDOWN`] into the profile's `registrymodifications.xcu` before LibreOffice starts.
+/// LibreOffice keeps entries it finds there, so this is a no-op after the first run.
+fn lock_down_lo_profile(profile: &Path) -> Result<()> {
+    let user = profile.join("user");
+    let xcu = user.join("registrymodifications.xcu");
+    let current = std::fs::read_to_string(&xcu).unwrap_or_default();
+    let pinned = |key: &str| {
+        current.lines().any(|l| {
+            l.contains(&format!("\"{key}\""))
+                && l.contains(if key == "MacroSecurityLevel" { "<value>3</value>" } else { "<value>true</value>" })
+        })
+    };
+    if pinned("MacroSecurityLevel") && pinned("DisableMacrosExecution") {
+        return Ok(());
+    }
+    let kept: String = current
+        .lines()
+        .filter(|l| {
+            !l.contains("\"MacroSecurityLevel\"")
+                && !l.contains("\"DisableMacrosExecution\"")
+                && !l.contains("</oor:items>")
+        })
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let head = if kept.contains("<oor:items") {
+        kept
+    } else {
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<oor:items xmlns:oor=\"http://openoffice.org/2001/registry\" xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">\n".to_string()
+    };
+    std::fs::create_dir_all(&user)?;
+    std::fs::write(&xcu, format!("{head}{LO_LOCKDOWN}</oor:items>\n"))?;
+    Ok(())
+}
 
 /// LibreOffice writes `outdir/<input stem>.<ext>`; this converts and moves the result to `to`.
 fn soffice_to(steps: &mut Vec<Step>, input: &Path, convert_to: &str, produced_ext: &str, scratch: &Path, to: PathBuf) {
@@ -235,20 +328,103 @@ fn pdf_pages(steps: &mut Vec<Step>, pdf: &Path, image: &str, dir: &Path, name: &
     steps.push(Step::Run(Cmd::new("pdftoppm").args(["-r", "300", format]).arg(pdf).arg(dir.join(name))));
 }
 
-fn extract(input: &Path, dest: &Path) -> Step {
+/// Unpacks `input` into the empty folder `dest`, never outside it: entry names are checked before
+/// anything is written, and links or device files leading out are removed afterwards.
+fn extract(input: &Path, dest: &Path) -> Vec<Step> {
     let ext = extension(input);
     let cmd = match ext.as_str() {
         "zip" => Cmd::new("unzip").arg("-q").arg(input).arg("-d").arg(dest),
-        "rar" => Cmd::new("unrar").args(["x", "-o+", "-idq"]).arg(input).arg(format!("{}/", dest.display())),
+        "rar" => Cmd::new("unrar").args(["x", "-o+", "-idq", "-p-"]).arg(input).arg(format!("{}/", dest.display())),
         "7z" => Cmd::new("7z").args(["x", "-y", "-bd"]).arg(format!("-o{}", dest.display())).arg(input),
         "gz" => {
             let mut c = Cmd::new("gzip").args(["-dc"]).arg(input);
             c.stdout = Some(dest.join(stem(input)));
-            c
+            return vec![Step::Run(c)];
         }
-        _ => Cmd::new("tar").arg("-xf").arg(input).arg("-C").arg(dest),
+        _ => Cmd::new("tar").args(["--no-same-owner", "--no-same-permissions", "-xf"]).arg(input).arg("-C").arg(dest),
     };
-    Step::Run(cmd)
+    vec![Step::CheckArchive(input.to_path_buf()), Step::Run(cmd), Step::Confine(dest.to_path_buf())]
+}
+
+/// The entry names of an archive, from its own tool's listing.
+fn archive_entries(input: &Path) -> Result<Vec<String>> {
+    let (program, args, prefix): (&str, &[&str], Option<&str>) = match extension(input).as_str() {
+        "zip" => ("unzip", &["-Z1"], None),
+        "rar" => ("unrar", &["lb", "-p-"], None),
+        "7z" => ("7z", &["l", "-ba", "-slt"], Some("Path = ")),
+        _ => ("tar", &["-tf"], None),
+    };
+    let out = Command::new(program)
+        .args(args)
+        .arg(input)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .with_context(|| format!("could not start {program}"))?;
+    if !out.status.success() {
+        bail!("{program} could not list {}", input.display());
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    Ok(text
+        .lines()
+        .filter_map(|l| match prefix {
+            Some(p) => l.strip_prefix(p),
+            None => Some(l),
+        })
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// An entry name that would land outside the folder it is extracted into.
+fn unsafe_entry(name: &str) -> bool {
+    name.starts_with('/') || name.starts_with('\\') || name.split(['/', '\\']).any(|part| part == "..")
+}
+
+/// Removes every symlink under `root` that leads outside it, and anything that is neither a file,
+/// a folder nor a link (devices, pipes). Never follows a link while walking.
+fn confine(root: &Path) -> Result<()> {
+    let base = root.canonicalize()?;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            let kind = std::fs::symlink_metadata(&path)?.file_type();
+            if kind.is_dir() {
+                stack.push(path);
+            } else if kind.is_symlink() {
+                let target = std::fs::read_link(&path)?;
+                let rel = path.parent().unwrap_or(root).strip_prefix(root).unwrap_or(Path::new("")).join(&target);
+                let escapes = target.is_absolute()
+                    || climbs_out(&rel)
+                    || path.canonicalize().is_ok_and(|real| !real.starts_with(&base));
+                if escapes {
+                    std::fs::remove_file(&path)?;
+                }
+            } else if !kind.is_file() {
+                std::fs::remove_file(&path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether a relative path, read without touching the disk, ever climbs above where it starts.
+fn climbs_out(rel: &Path) -> bool {
+    use std::path::Component;
+    let mut depth = 0i32;
+    for c in rel.components() {
+        match c {
+            Component::ParentDir => depth -= 1,
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) => return true,
+        }
+        if depth < 0 {
+            return true;
+        }
+    }
+    false
 }
 
 fn convert_job(input: &Path, target: &'static str, scratch: &Path, names: &mut Names) -> Result<Job> {
@@ -262,9 +438,7 @@ fn convert_job(input: &Path, target: &'static str, scratch: &Path, names: &mut N
         Kind::Image => {
             // Only the first frame of an animation or layered file becomes a still.
             let frame = if matches!(src.as_str(), "gif" | "tiff") && target != src { "[0]" } else { "" };
-            let mut source = input.as_os_str().to_owned();
-            source.push(frame);
-            steps.push(Step::Run(Cmd::new(magick()).arg(source).arg("-auto-orient").arg(&out)));
+            steps.push(Step::Run(Cmd::new(magick()).arg(im_input(input, frame)).arg("-auto-orient").arg(&out)));
         }
         Kind::Audio | Kind::Video => {
             steps.push(Step::Run(ffmpeg(input).args(ffmpeg_codec(target).iter().copied()).arg(&out)));
@@ -318,9 +492,10 @@ fn convert_job(input: &Path, target: &'static str, scratch: &Path, names: &mut N
         Kind::Archive => {
             let unpacked = scratch.join(format!("x-{name}"));
             steps.push(Step::MkDir(unpacked.clone()));
-            steps.push(extract(input, &unpacked));
+            steps.extend(extract(input, &unpacked));
             let pack = match target {
-                "zip" => Cmd::new("zip").args(["-r", "-q"]).arg(&out).arg("."),
+                // `-y` stores links as links: an archive's link must never pull in the file it names.
+                "zip" => Cmd::new("zip").args(["-r", "-q", "-y"]).arg(&out).arg("."),
                 "tar" => Cmd::new("tar").arg("-cf").arg(&out).arg("."),
                 _ => Cmd::new("tar").arg("-czf").arg(&out).arg("."),
             };
@@ -329,6 +504,40 @@ fn convert_job(input: &Path, target: &'static str, scratch: &Path, names: &mut N
         Kind::Other => bail!("{} cannot be converted", input.display()),
     }
     Ok(Job { steps, outputs: vec![out] })
+}
+
+/// What keeps pandoc from reading files other than its input, or the network: `--sandbox` when it
+/// works (2.15 and later; some 3.1 builds cannot read their own templates in it), otherwise a Lua
+/// filter dropping images named outside the document's folder or by URL.
+fn pandoc_guard() -> &'static [OsString] {
+    static GUARD: std::sync::OnceLock<Vec<OsString>> = std::sync::OnceLock::new();
+    GUARD.get_or_init(|| {
+        let Ok(dir) = tempfile::Builder::new().prefix("clementine-pandoc-").tempdir() else { return Vec::new() };
+        let probe_in = dir.path().join("probe.md");
+        let probe_out = dir.path().join("probe.docx");
+        let sandbox_works = std::fs::write(&probe_in, "probe\n").is_ok()
+            && command("pandoc")
+                .arg("--sandbox")
+                .arg("-o")
+                .arg(&probe_out)
+                .arg(&probe_in)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+        if sandbox_works {
+            return vec!["--sandbox".into()];
+        }
+        let filter = dir.path().join("local-only.lua");
+        if std::fs::write(&filter, include_str!("../data/pandoc/local-only.lua")).is_err() {
+            return Vec::new();
+        }
+        let _ = std::fs::remove_file(&probe_in);
+        let mut arg = OsString::from("--lua-filter=");
+        arg.push(dir.keep().join("local-only.lua"));
+        vec![arg]
+    })
 }
 
 fn pandoc(input: &Path, src: &str, target: &str, out: &Path) -> Cmd {
@@ -342,6 +551,7 @@ fn pandoc(input: &Path, src: &str, target: &str, out: &Path) -> Cmd {
         other => other,
     };
     let mut cmd = Cmd::new("pandoc").args(["-f", reader, "-t", writer]);
+    cmd = cmd.args(pandoc_guard().iter().cloned());
     if matches!(target, "html" | "epub") {
         cmd = cmd.arg("--standalone").arg("--metadata").arg(format!("title={}", stem(input)));
     }
@@ -372,7 +582,7 @@ fn tool_job(input: &Path, tool: Tool, setup: &Setup, names: &mut Names) -> Resul
     let ext = extension(input);
     let mut steps = Vec::new();
     let im = |out: &Path, args: &[&str]| {
-        Step::Run(Cmd::new(magick()).arg(input).arg("-auto-orient").args(args.iter().copied()).arg(out))
+        Step::Run(Cmd::new(magick()).arg(im_input(input, "")).arg("-auto-orient").args(args.iter().copied()).arg(out))
     };
     let out = match tool {
         Tool::CompressImage => {
@@ -560,7 +770,7 @@ fn tool_job(input: &Path, tool: Tool, setup: &Setup, names: &mut Names) -> Resul
         Tool::Extract => {
             let out = names.claim(&dir, &name, "");
             steps.push(Step::MkDir(out.clone()));
-            steps.push(extract(input, &out));
+            steps.extend(extract(input, &out));
             out
         }
         Tool::MergePdf | Tool::Zip => bail!("{tool:?} works on the whole selection"),
@@ -643,7 +853,10 @@ pub fn missing_programs(op: Op, files: &[PathBuf]) -> Vec<String> {
 
 fn run_cmd(cmd: &Cmd) -> Result<()> {
     let _lo = (cmd.program == "soffice").then(|| LO_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
-    let mut c = Command::new(&cmd.program);
+    if cmd.program == "soffice" {
+        lock_down_lo_profile(&lo_profile()).context("preparing the LibreOffice profile")?;
+    }
+    let mut c = command(&cmd.program);
     c.args(&cmd.args).stdin(Stdio::null()).stderr(Stdio::piped());
     if let Some(dir) = &cmd.cwd {
         c.current_dir(dir);
@@ -681,6 +894,11 @@ fn run_step(step: &Step) -> Result<()> {
             let text = std::fs::read_to_string(from)?;
             Ok(std::fs::write(to, subtitle_text(&text))?)
         }
+        Step::CheckArchive(archive) => match archive_entries(archive)?.into_iter().find(|e| unsafe_entry(e)) {
+            Some(bad) => bail!("refusing {}: its entry {bad:?} points outside the folder", archive.display()),
+            None => Ok(()),
+        },
+        Step::Confine(dir) => confine(dir),
     }
 }
 
@@ -714,21 +932,22 @@ pub fn run(op: Op, files: &[PathBuf], params: Option<&Params>, dest: Option<&Pat
 
 /// Runs a probe and returns its trimmed stdout, or `None` if it failed.
 fn capture(program: &str, args: &[&OsStr]) -> Option<String> {
-    let out = Command::new(program).args(args).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+    let out = command(program).args(args).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// A media file's length in seconds, from ffprobe.
 pub fn media_duration(path: &Path) -> Option<f64> {
-    let args = ["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1"].map(OsStr::new);
+    let args =
+        ["-v", "error", "-protocol_whitelist", "file", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1"]
+            .map(OsStr::new);
     let text = capture("ffprobe", &[&args[..], &[path.as_os_str()]].concat())?;
     text.lines().next()?.trim().parse().ok().filter(|d: &f64| d.is_finite() && *d > 0.0)
 }
 
 /// An image's width and height as the tools see it: first frame, upright.
 pub fn image_size(path: &Path) -> Option<(u32, u32)> {
-    let mut first = path.as_os_str().to_owned();
-    first.push("[0]");
+    let first = im_input(path, "[0]");
     let args = [
         first.as_os_str(),
         OsStr::new("-auto-orient"),
@@ -1143,3 +1362,7 @@ mod real {
         assert!(failures.is_empty(), "\n{}", failures.join("\n"));
     }
 }
+
+#[cfg(test)]
+#[path = "security_tests.rs"]
+mod security_tests;
