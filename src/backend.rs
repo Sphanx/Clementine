@@ -11,7 +11,6 @@ use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -263,7 +262,8 @@ fn ffmpeg_codec(target: &str) -> &'static [&'static str] {
 }
 
 /// LibreOffice's profile lives in the user's cache, so it starts warm after the first run.
-/// Two instances on one profile fight, so LibreOffice calls are serialised by [`LO_LOCK`].
+/// Two instances on one profile fight, so every LibreOffice call holds [`lock_lo`] — across
+/// threads and across Susen processes.
 fn soffice(input: &Path, convert_to: &str, outdir: &Path, infilter: Option<&str>) -> Cmd {
     let profile = lo_profile();
     let mut cmd = Cmd::new("soffice")
@@ -275,7 +275,37 @@ fn soffice(input: &Path, convert_to: &str, outdir: &Path, infilter: Option<&str>
     cmd.arg("--convert-to").arg(convert_to).arg("--outdir").arg(outdir).arg(input)
 }
 
-static LO_LOCK: Mutex<()> = Mutex::new(());
+/// An exclusive `flock` on `libreoffice.lock` next to the profile, released when dropped.
+/// Waits for another holder (another thread, or another Susen process) while polling `cancel`,
+/// so a queued conversion can still be cancelled.
+fn lock_lo(cancel: &Cancel) -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let profile = lo_profile();
+    let path = profile.with_file_name("libreoffice.lock");
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    loop {
+        // SAFETY: a valid descriptor owned by `file`; the lock goes with it when it is closed.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(file);
+        }
+        let err = std::io::Error::last_os_error();
+        if !matches!(err.raw_os_error(), Some(libc::EWOULDBLOCK | libc::EINTR)) {
+            return Err(err).with_context(|| format!("locking {}", path.display()));
+        }
+        if cancel.is_cancelled() {
+            return Err(Cancelled.into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
 
 fn lo_profile() -> PathBuf {
     let cache = std::env::var_os("XDG_CACHE_HOME")
@@ -891,7 +921,7 @@ fn run_cmd_with(cmd: &Cmd, ctx: &Ctx) -> Result<()> {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    let _lo = (cmd.program == "soffice").then(|| LO_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+    let _lo = if cmd.program == "soffice" { Some(lock_lo(ctx.cancel)?) } else { None };
     if ctx.cancel.is_cancelled() {
         return Err(Cancelled.into());
     }

@@ -406,7 +406,7 @@ fn run_any(op: Op, files: &[PathBuf], dir: &Path, secs: u64) -> Result<Outcome, 
 
 /// Other Susen processes (a second checkout, the GUI, the file manager menus) share the
 /// LibreOffice profile in `~/.cache/susen`, and LibreOffice fails silently when two
-/// processes use one profile (see `bug_two_processes_convert_with_libreoffice_at_once`). The
+/// processes use one profile (fixed with a `flock`, see `qa_two_processes_convert_with_libreoffice_at_once`). The
 /// tests here get a cache folder of their own.
 fn isolate_libreoffice() {
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1232,7 +1232,7 @@ fn bug_concurrent_runs_never_share_an_output() {
     assert_eq!((distinct.len(), on_disk), (8, 8), "outputs reported: {outs:?}");
 }
 
-/// Two LibreOffice conversions at once (different files) both succeed: `LO_LOCK` queues them.
+/// Two LibreOffice conversions at once (different files) both succeed: the LibreOffice lock queues them.
 #[test]
 #[ignore = "slow: runs the converters"]
 fn qa_two_libreoffice_jobs_at_once() {
@@ -1548,13 +1548,13 @@ fn qa_cli_fails_cleanly() {
     assert!(bad.is_empty(), "\n{}", bad.join("\n"));
 }
 
-/// Two Susen processes (two file-manager menu clicks, or the CLI next to the window) convert
-/// with LibreOffice at once. `LO_LOCK` only queues calls inside one process; across processes
-/// both share `~/.cache/susen/libreoffice`, and the second LibreOffice hands its job to the
+/// with LibreOffice at once. Both share `~/.cache/susen/libreoffice`, and without a lock across
+/// processes the second LibreOffice hands its job to the first and exits 1 without a message;
+/// the `flock` on `libreoffice.lock` queues them.
 /// first and exits 1 without a message.
 #[test]
-#[ignore = "BUG: two processes converting with LibreOffice at once fail silently (shared profile)"]
-fn bug_two_processes_convert_with_libreoffice_at_once() {
+#[ignore = "slow: runs the converters"]
+fn qa_two_processes_convert_with_libreoffice_at_once() {
     if !has_program("soffice") {
         return;
     }
