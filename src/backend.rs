@@ -1161,10 +1161,49 @@ pub fn missing_programs(op: Op, files: &[PathBuf]) -> Vec<String> {
     if matches!(op, Op::Tool(Tool::SplitMedia | Tool::FadeAudio)) {
         programs.push("ffprobe".into());
     }
+    // ImageMagick writes HEIC and AVIF through libheif, whose encoders are separate packages.
+    let mut plugins = Vec::new();
+    if let Op::Convert(target) = op
+        && files.iter().all(|f| kind_of(f) == Kind::Image)
+        && let Some(plugin) = heif_plugin_missing(target)
+    {
+        plugins.push(plugin.to_string());
+    }
     let mut missing: Vec<String> = programs.into_iter().filter(|p| !has_program(p)).collect();
+    missing.extend(plugins);
     missing.sort();
     missing.dedup();
     missing
+}
+
+/// The libheif encoder package ImageMagick lacks to write `target` (`heic`, `avif`), if it does.
+/// `magick -list format` is asked once per run of the app; when it cannot be asked, or
+/// ImageMagick is missing (reported on its own), nothing is assumed missing.
+fn heif_plugin_missing(target: &str) -> Option<&'static str> {
+    static FORMATS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let plugin = match target {
+        "heic" => "libheif-plugin-x265",
+        "avif" => "libheif-plugin-aomenc",
+        _ => return None,
+    };
+    if !has_program(magick()) {
+        return None;
+    }
+    let list =
+        FORMATS.get_or_init(|| capture(magick(), &[OsStr::new("-list"), OsStr::new("format")]).unwrap_or_default());
+    if list.is_empty() {
+        return None;
+    }
+    (!im_lists_writable(list, target)).then_some(plugin)
+}
+
+/// Whether `-list format` output shows `format` with a write mode (`rw+`, `-w-`…).
+fn im_lists_writable(list: &str, format: &str) -> bool {
+    list.lines().any(|l| {
+        let mut words = l.split_whitespace();
+        words.next().is_some_and(|f| f.trim_end_matches('*').eq_ignore_ascii_case(format))
+            && words.next().is_some_and(|m| m.len() == 3 && m.as_bytes()[1] == b'w')
+    })
 }
 
 /// What a running step reports to, and what can stop it.
@@ -1599,6 +1638,14 @@ mod tests {
         // Without a folder, nothing changes.
         let jobs = plan(Op::Convert("jpg"), &files, None, Path::new("/tmp/scratch")).unwrap();
         assert_eq!(jobs[0].outputs, vec![dir.path().join("a.jpg")]);
+    }
+
+    #[test]
+    fn heif_write_support_is_read_from_the_format_list() {
+        let list = "   Format  Mode  Description\n     AVIF* r--   AV1 Image File Format (1.17.6)\n     HEIC  rw+   Apple High efficiency Image Format\n";
+        assert!(im_lists_writable(list, "heic"));
+        assert!(!im_lists_writable(list, "avif"));
+        assert!(!im_lists_writable(list, "webp"));
     }
 
     #[test]

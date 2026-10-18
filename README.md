@@ -202,7 +202,9 @@ sudo apt install ./susen_0.1.0-1_amd64.deb
 ```
 
 apt pulls in GTK 4 and recommends the converters (ffmpeg, ImageMagick, pandoc, poppler-utils, zip,
-unzip). LibreOffice, unrar, p7zip, ghostscript and qpdf are suggested, not installed.
+unzip) and the libheif plugins ImageMagick needs for HEIC and AVIF (`libheif-plugin-x265` and
+`libheif-plugin-aomenc` to write them, `libheif-plugin-libde265` to read HEIC). Without a writer
+plugin the HEIC or AVIF slice is grey, and hovering it names the package. LibreOffice, unrar, p7zip, ghostscript and qpdf are suggested, not installed.
 
 **Flatpak.** The manifest is `flatpak/io.github.sphanx.Susen.yml`; it is not on Flathub yet.
 
