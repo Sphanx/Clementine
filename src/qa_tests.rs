@@ -1155,8 +1155,8 @@ fn encrypted_samples(dir: &Path) -> Vec<PathBuf> {
 /// Password-protected inputs fail with an error and never wait for a password. Programs are
 /// started without a terminal (`setsid`), like the GUI is.
 #[test]
-#[ignore = "BUG: password-protected archives and PDFs hang or fail without saying why"]
-fn bug_password_protected_inputs_fail_cleanly() {
+#[ignore = "slow: runs the converters"]
+fn qa_password_protected_inputs_fail_cleanly() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     let mut bad = Vec::new();

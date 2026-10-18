@@ -48,7 +48,7 @@ colours (light, dark and high contrast), and a muted purple selection; every lab
 4.5:1 contrast ratio or better. Long labels wrap, shrink, then ellipsize to stay inside their slice.
 
 When a conversion fails, the status line says why in plain words (missing HEIC/AVIF support,
-unsupported codec, password-protected PDF, damaged file); hover **Failed** for the program's own message.
+unsupported codec, password-protected PDF or archive, damaged file); hover **Failed** for the program's own message.
 
 **Settings** (the gear in the header bar) change which modifier opens which wheel (Shift, Ctrl, Alt or
 Super, each on one wheel only), whether results go next to the original or into one folder, and whether

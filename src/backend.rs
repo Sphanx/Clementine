@@ -60,6 +60,8 @@ pub enum Step {
     CheckArchive(PathBuf),
     /// Removes what an extraction left in this folder that leads outside it (see [`confine`]).
     Confine(PathBuf),
+    /// Refuses a password-protected PDF or archive before anything runs on it (see [`locked`]).
+    Unlocked(PathBuf),
     /// A symlink `to` → `from`, giving an input a name no program reads as a pattern.
     Link {
         from: PathBuf,
@@ -512,7 +514,7 @@ fn extract(input: &Path, dest: &Path) -> Vec<Step> {
     let cmd = match ext.as_str() {
         "zip" => Cmd::new("unzip").arg("-q").arg(input).arg("-d").arg(dest),
         "rar" => Cmd::new("unrar").args(["x", "-o+", "-idq", "-p-"]).arg(input).arg(format!("{}/", dest.display())),
-        "7z" => Cmd::new("7z").args(["x", "-y", "-bd"]).arg(format!("-o{}", dest.display())).arg(input),
+        "7z" => Cmd::new("7z").args(["x", "-y", "-bd", "-p"]).arg(format!("-o{}", dest.display())).arg(input),
         "gz" => {
             let mut c = Cmd::new("gzip").args(["-dc"]).arg(input);
             c.stdout = Some(dest.join(stem(input)));
@@ -528,7 +530,7 @@ fn archive_entries(input: &Path) -> Result<Vec<String>> {
     let (program, args, prefix): (&str, &[&str], Option<&str>) = match extension(input).as_str() {
         "zip" => ("unzip", &["-Z1"], None),
         "rar" => ("unrar", &["lb", "-p-"], None),
-        "7z" => ("7z", &["l", "-ba", "-slt"], Some("Path = ")),
+        "7z" => ("7z", &["l", "-ba", "-slt", "-p"], Some("Path = ")),
         _ => ("tar", &["-tf"], None),
     };
     let out = Command::new(program)
@@ -551,6 +553,49 @@ fn archive_entries(input: &Path) -> Result<Vec<String>> {
         .filter(|l| !l.is_empty())
         .map(str::to_string)
         .collect())
+}
+
+/// `Some("PDF")` or `Some("archive")` when `path` cannot be opened without a password. Asks the
+/// file's own tools, never with a terminal or a password to type (stdin is null, and the archive
+/// tools get an empty password). A file that is merely damaged, or whose tool is missing, is
+/// `None`: the converter then reports its own error.
+fn locked(path: &Path) -> Option<&'static str> {
+    let run = |program: &str, args: &[&str]| -> Option<(Option<i32>, String)> {
+        if !has_program(program) {
+            return None;
+        }
+        let out = Command::new(program).args(args).arg(path).stdin(Stdio::null()).output().ok()?;
+        let text = format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        Some((out.status.code(), text))
+    };
+    let yes = match (kind_of(path), extension(path).as_str()) {
+        // qpdf: exit 0 means a password is needed (2 not encrypted, 3 encrypted but opens).
+        (Kind::Pdf, _) => match run("qpdf", &["--requires-password"]) {
+            Some((code, _)) => code == Some(0),
+            None => run("pdfinfo", &[]).is_some_and(|(_, t)| t.contains("Incorrect password")),
+        },
+        // zipinfo marks an encrypted entry with an upper-case `T` or `B` (text or binary).
+        (_, "zip") => run("unzip", &["-Z"]).is_some_and(|(_, t)| {
+            t.lines().any(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                f.len() >= 9 && f[0].len() == 10 && (f[4].starts_with('T') || f[4].starts_with('B'))
+            })
+        }),
+        (_, "7z") => run("7z", &["l", "-slt", "-p"]).is_some_and(|(_, t)| {
+            t.contains("Encrypted = +") || t.contains("Wrong password") || t.contains("encrypted archive")
+        }),
+        (_, "rar") => run("unrar", &["lt", "-p-"]).is_some_and(|(_, t)| {
+            t.contains("Flags: encrypted") || t.contains("Incorrect password") || t.contains("encrypted headers")
+        }),
+        _ => false,
+    };
+    if !yes {
+        None
+    } else if kind_of(path) == Kind::Pdf {
+        Some("PDF")
+    } else {
+        Some("archive")
+    }
 }
 
 /// An entry name that would land outside the folder it is extracted into.
@@ -1028,6 +1073,35 @@ fn plan_jobs(
     names: &mut Names,
     probe: bool,
 ) -> Result<Vec<Job>> {
+    let mut jobs = plan_jobs_unchecked(op, files, params, scratch, names, probe)?;
+    // Each job first refuses a password-protected input, with a message that says so; the
+    // converters themselves fail obscurely or (Ghostscript) write an empty file.
+    let check = |f: &PathBuf| matches!(kind_of(f), Kind::Pdf | Kind::Archive).then(|| Step::Unlocked(f.clone()));
+    match op {
+        Op::Tool(Tool::Zip) => {}
+        Op::Tool(Tool::MergePdf) => {
+            let checks: Vec<Step> = files.iter().filter_map(check).collect();
+            jobs[0].steps.splice(0..0, checks);
+        }
+        _ => {
+            for (job, f) in jobs.iter_mut().zip(files) {
+                if let Some(step) = check(f) {
+                    job.steps.insert(0, step);
+                }
+            }
+        }
+    }
+    Ok(jobs)
+}
+
+fn plan_jobs_unchecked(
+    op: Op,
+    files: &[PathBuf],
+    params: Option<&Params>,
+    scratch: &Path,
+    names: &mut Names,
+    probe: bool,
+) -> Result<Vec<Job>> {
     let first = files.first().ok_or_else(|| anyhow!("nothing selected"))?;
     match op {
         Op::Convert(target) => files.iter().map(|f| convert_job(f, target, scratch, names)).collect(),
@@ -1231,6 +1305,13 @@ fn run_step(step: &Step, ctx: &Ctx) -> Result<()> {
             }
             move_file(from, to)
         }
+        Step::Unlocked(path) => match locked(path) {
+            Some(what) => bail!(
+                "{} is a password-protected {what}; Susen cannot open it without the password",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ),
+            None => Ok(()),
+        },
         Step::Link { from, to } => {
             std::os::unix::fs::symlink(from, to).with_context(|| format!("linking {}", from.display()))
         }
