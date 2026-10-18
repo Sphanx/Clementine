@@ -222,6 +222,20 @@ fn cut(input: &Path, start: f64, len: f64, out: &Path) -> Cmd {
     cmd.arg(out)
 }
 
+/// How Speed… hands its retimed frames to the encoder.
+///
+/// Passthrough keeps every frame at its new time; the default constant frame rate drops or
+/// repeats frames and lands up to a few frames off the asked length. AVI, WMV, MPEG and FLV
+/// encoders count time in whole frames of the source rate, though, so a sped-up clip gives them
+/// two frames in one tick and they stop with "Invalid pts". Variable frame rate drops those
+/// extra frames instead (measured: within 0.11 s of the asked length from 0.25× to 4×).
+fn speed_fps_mode(input: &Path) -> &'static str {
+    match canonical(&extension(input)) {
+        "avi" | "wmv" | "mpg" | "mpeg" | "flv" => "vfr",
+        _ => "passthrough",
+    }
+}
+
 /// Encoder settings for a conversion target.
 fn ffmpeg_codec(target: &str) -> &'static [&'static str] {
     match target {
@@ -705,12 +719,10 @@ fn tool_job(input: &Path, tool: Tool, setup: &Setup, names: &mut Names) -> Resul
             let out = names.claim(&dir, &format!("{name} ({})", speed_name(f)), &ext);
             let mut cmd = ffmpeg(input);
             if kind_of(input) == Kind::Video {
-                // Passthrough keeps every frame at its new time; the default constant frame rate
-                // drops or repeats frames and lands up to a few frames off the asked length.
                 cmd = cmd
                     .arg("-filter:v")
                     .arg(format!("setpts=PTS/{}", trim_number(f)))
-                    .args(["-fps_mode", "passthrough"]);
+                    .args(["-fps_mode", speed_fps_mode(input)]);
             }
             cmd = cmd.arg("-filter:a").arg(atempo_chain(f)).args(reencode(input).iter().copied());
             steps.push(Step::Run(cmd.arg(&out)));
@@ -1251,6 +1263,21 @@ mod tests {
         assert!(mp4.windows(2).any(|w| w == ["-ss", "1.5"]) && mp4.windows(2).any(|w| w == ["-t", "2.5"]), "{mp4:?}");
         assert!(mp4.iter().any(|a| a == "libx264") && !mp4.iter().any(|a| a == "copy"), "{mp4:?}");
         assert!(mp4.last().unwrap().ends_with("a (trimmed).mp4"));
+    }
+
+    #[test]
+    fn speed_drops_extra_frames_only_where_the_encoder_counts_whole_frames() {
+        let mode = |file: &str| {
+            let args = args_of(Op::Tool(Tool::Speed), file, Params::Speed(2.0));
+            let at = args.iter().position(|a| a == "-fps_mode").expect("no -fps_mode");
+            args[at + 1].clone()
+        };
+        for file in ["a.mp4", "a.m4v", "a.mov", "a.mkv", "a.webm"] {
+            assert_eq!(mode(file), "passthrough", "{file}");
+        }
+        for file in ["a.avi", "a.wmv", "a.mpg", "a.mpeg", "a.flv"] {
+            assert_eq!(mode(file), "vfr", "{file}");
+        }
     }
 
     #[test]
