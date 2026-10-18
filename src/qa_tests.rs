@@ -576,6 +576,7 @@ fn more_samples(dir: &Path) -> Vec<PathBuf> {
         ("v_avi.avi", &["-c:v", "mpeg4", "-c:a", "libmp3lame"]),
         ("v_wmv.wmv", &["-c:v", "wmv2", "-c:a", "wmav2"]),
         ("v_mpg.mpg", &["-c:v", "mpeg2video", "-c:a", "mp2"]),
+        ("v_mpeg.mpeg", &["-c:v", "mpeg1video", "-c:a", "mp2"]),
         ("v_flv.flv", &["-c:v", "flv1", "-c:a", "libmp3lame", "-ar", "44100"]),
         ("v_m4v.m4v", &["-c:v", "libx264", "-c:a", "aac"]),
     ] {
@@ -656,11 +657,6 @@ fn known_bug(file: &Path, op: Op) -> Option<&'static str> {
     let name = file.file_name()?.to_str()?;
     match (name, op) {
         ("i_multi.tiff", Op::Tool(Tool::Resize)) => Some("bug_resize_on_animations_and_multi_page_images"),
-        ("a_wma.wma", Op::Tool(Tool::NormalizeAudio)) => Some("bug_normalize_wma"),
-        ("v_avi.avi" | "v_wmv.wmv" | "v_mpg.mpg" | "v_flv.flv", Op::Tool(Tool::Speed)) => {
-            Some("bug_speed_on_avi_wmv_mpg_flv")
-        }
-        ("v_mpg.mpg", Op::Convert("mkv")) => Some("bug_mpg_to_mkv"),
         _ => None,
     }
 }
@@ -1339,21 +1335,48 @@ fn bug_resize_on_animations_and_multi_page_images() {
     );
 }
 
-/// Normalize: `loudnorm` outputs 192 kHz, which the WMA encoder refuses (no `-ar` is given).
+/// Normalize: `loudnorm` outputs 192 kHz, which the WMA encoder refused; the source's rate is
+/// now asked for with `-ar`.
 #[test]
-#[ignore = "BUG: Normalize fails on WMA (loudnorm resamples to 192 kHz)"]
-fn bug_normalize_wma() {
+#[ignore = "slow: runs the converters"]
+fn normalize_wma() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     ff(d, &["-f", "lavfi", "-i", "sine=duration=1", "-c:a", "wmav2", "a.wma"]);
     expect_all_work(vec![(d.join("a.wma"), Op::Tool(Tool::NormalizeAudio))], d);
 }
 
-/// Speed…: `-fps_mode passthrough` hands the encoder duplicate timestamps, which AVI, WMV, MPG and
-/// FLV encoders refuse ("Invalid pts").
+/// Normalize keeps the sample rate of every audio format it is offered on (Opus is always
+/// 48 kHz), at 44.1 and 22.05 kHz.
 #[test]
-#[ignore = "BUG: Speed fails on AVI, WMV, MPG and FLV"]
-fn bug_speed_on_avi_wmv_mpg_flv() {
+#[ignore = "slow: runs the converters"]
+fn normalize_keeps_the_sample_rate() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mut failures = Vec::new();
+    for rate in ["44100", "22050"] {
+        for ext in ["mp3", "m4a", "wav", "flac", "ogg", "opus", "aiff", "wma", "aac"] {
+            let name = format!("a{rate}.{ext}");
+            ff(d, &["-f", "lavfi", "-i", &format!("sine=duration=1:sample_rate={rate}"), &name]);
+            let file = d.join(&name);
+            let want = backend::sample_rate(&file).unwrap();
+            match run(Op::Tool(Tool::NormalizeAudio), std::slice::from_ref(&file), None, None) {
+                Ok(outs) => match backend::sample_rate(&outs[0]) {
+                    Some(got) if got == want => println!("ok   {name}: {got} Hz"),
+                    got => failures.push(format!("{name}: {got:?} Hz, wanted {want}")),
+                },
+                Err(e) => failures.push(format!("{name}: {e:#}")),
+            }
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// Speed…: `-fps_mode passthrough` handed AVI, WMV, MPG and FLV encoders duplicate timestamps
+/// ("Invalid pts"); they now get variable frame rate.
+#[test]
+#[ignore = "slow: runs the converters"]
+fn speed_on_avi_wmv_mpg_flv() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     let cases = vec![
@@ -1365,14 +1388,156 @@ fn bug_speed_on_avi_wmv_mpg_flv() {
     expect_all_work(cases, d);
 }
 
-/// MPG → MKV stream-copies (`-c copy`), and MPEG-PS packets without timestamps cannot be muxed.
+/// The video samples of every container the catalog accepts, one second long.
+fn video_samples(d: &Path) -> Vec<PathBuf> {
+    [
+        ("v.mp4", &["-c:v", "libx264", "-c:a", "aac"][..]),
+        ("v.m4v", &["-c:v", "libx264", "-c:a", "aac"]),
+        ("v.mov", &["-c:v", "libx264", "-c:a", "aac"]),
+        ("v.mkv", &["-c:v", "libx264", "-c:a", "aac"]),
+        ("v.webm", &["-c:v", "libvpx-vp9", "-c:a", "libopus"]),
+        ("v.avi", &["-c:v", "mpeg4", "-c:a", "libmp3lame"]),
+        ("v.wmv", &["-c:v", "wmv2", "-c:a", "wmav2"]),
+        ("v.mpg", &["-c:v", "mpeg2video", "-c:a", "mp2"]),
+        ("v.mpeg", &["-c:v", "mpeg1video", "-c:a", "mp2"]),
+        ("v.flv", &["-c:v", "flv1", "-c:a", "libmp3lame", "-ar", "44100"]),
+    ]
+    .into_iter()
+    .map(|(name, codecs)| ff_sample(d, name, codecs))
+    .collect()
+}
+
+/// Speed… (extremes), Trim…, Split… and Fade… on every audio and video container: each output
+/// lands within 0.15 s of the length asked, plus the padding the sample's encoder added.
 #[test]
-#[ignore = "BUG: MPG to MKV fails (stream copy of packets without timestamps)"]
-fn bug_mpg_to_mkv() {
+#[ignore = "slow: runs the converters"]
+fn media_tools_keep_lengths_in_every_container() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mut files = video_samples(d);
+    for ext in ["mp3", "m4a", "wav", "flac", "ogg", "opus", "aiff", "wma", "aac"] {
+        let name = format!("a.{ext}");
+        ff(d, &["-f", "lavfi", "-i", "sine=duration=1", &name]);
+        files.push(d.join(name));
+    }
+    let mut failures = Vec::new();
+    for file in files {
+        // Every sample holds 1 s; what a container reports beyond that is encoder padding (MP3,
+        // WMA), which a speed change stretches with the rest.
+        let source = media_duration(&file).unwrap();
+        let pad = (source - 1.0).abs();
+        let cases = [
+            (Tool::Speed, Params::Speed(0.25), 4.0, pad * 4.0),
+            (Tool::Speed, Params::Speed(4.0), 0.25, pad),
+            (Tool::Trim, Params::Trim { start: 0.25, end: 0.75 }, 0.5, pad),
+            (Tool::SplitMedia, Params::Split(SplitBy::Parts(2)), source / 2.0, pad),
+            (Tool::FadeAudio, Params::Fade { fade_in: 0.2, fade_out: 0.3 }, source, 0.0),
+        ];
+        for (tool, params, want, pad) in cases {
+            let name = format!("{} {params:?}", file.file_name().unwrap().to_string_lossy());
+            let outs = match run(Op::Tool(tool), std::slice::from_ref(&file), Some(&params), None) {
+                Ok(outs) => outs,
+                Err(e) => {
+                    failures.push(format!("{name}: {e:#}"));
+                    continue;
+                }
+            };
+            // A split gives a folder; its first part is checked.
+            let out = if outs[0].is_dir() {
+                let mut parts: Vec<PathBuf> = std::fs::read_dir(&outs[0]).unwrap().map(|e| e.unwrap().path()).collect();
+                parts.sort();
+                parts[0].clone()
+            } else {
+                outs[0].clone()
+            };
+            match media_duration(&out) {
+                Some(got) if (got - want).abs() <= 0.15 + pad => println!("ok   {name}: {got:.3} s"),
+                got => failures.push(format!("{name}: {got:?} s, wanted {want:.3}")),
+            }
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// Speed… at 0.5× and 2× in every video container lands within 0.15 s of the asked length.
+#[test]
+#[ignore = "slow: runs the converters"]
+fn speed_keeps_the_asked_length_in_every_video_container() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut failures = Vec::new();
+    for file in video_samples(dir.path()) {
+        let source = media_duration(&file).unwrap();
+        for f in [0.5, 2.0] {
+            let name = format!("{} at {f}x", file.file_name().unwrap().to_string_lossy());
+            match run(Op::Tool(Tool::Speed), std::slice::from_ref(&file), Some(&Params::Speed(f)), None) {
+                Ok(outs) => {
+                    let got = media_duration(&outs[0]);
+                    match got {
+                        Some(g) if (g - source / f).abs() <= 0.15 => println!("ok   {name}: {g:.3} s"),
+                        _ => failures.push(format!("{name}: {got:?} s, wanted {:.3}", source / f)),
+                    }
+                    std::fs::remove_file(&outs[0]).unwrap();
+                }
+                Err(e) => failures.push(format!("{name}: {e:#}")),
+            }
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// MPG → MKV stream-copied packets without timestamps, which Matroska cannot store; ffmpeg now
+/// generates them (`-fflags +genpts`).
+#[test]
+#[ignore = "slow: runs the converters"]
+fn mpg_to_mkv() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     let mpg = ff_sample(d, "a.mpg", &["-c:v", "mpeg2video", "-c:a", "mp2"]);
     expect_all_work(vec![(mpg, Op::Convert("mkv"))], d);
+}
+
+/// Every video container → MKV, plus the awkward ones: an MP4 with its own subtitle format, a
+/// QuickTime file with a timecode track and a DVD program stream with navigation packets. Each
+/// copy must decode without an error and keep its length.
+#[test]
+#[ignore = "slow: runs the converters"]
+fn every_video_container_to_mkv() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mut files = video_samples(d);
+    std::fs::write(d.join("t.srt"), "1\n00:00:00,200 --> 00:00:00,800\nHi\n").unwrap();
+    ff(d, &["-i", "v.mp4", "-i", "t.srt", "-map", "0", "-map", "1", "-c", "copy", "-c:s", "mov_text", "subs.mp4"]);
+    ff(d, &["-i", "v.mov", "-timecode", "01:00:00:00", "-c", "copy", "timecode.mov"]);
+    files.push(d.join("subs.mp4"));
+    files.push(d.join("timecode.mov"));
+    files.push(ff_sample(d, "dvd.mpg", &["-target", "pal-dvd", "-s", "128x96"]));
+    let mut failures = Vec::new();
+    for file in files {
+        let name = file.file_name().unwrap().to_string_lossy().into_owned();
+        let outs = match run(Op::Convert("mkv"), std::slice::from_ref(&file), None, None) {
+            Ok(outs) => outs,
+            Err(e) => {
+                failures.push(format!("{name}: {e:#}"));
+                continue;
+            }
+        };
+        let decode = Command::new("ffmpeg")
+            .args(["-v", "error", "-nostdin", "-i"])
+            .arg(&outs[0])
+            .args(["-f", "null", "-"])
+            .output()
+            .unwrap();
+        let (want, got) = (media_duration(&file).unwrap(), media_duration(&outs[0]));
+        if !decode.status.success() || !decode.stderr.is_empty() {
+            failures.push(format!("{name}: does not decode: {}", String::from_utf8_lossy(&decode.stderr)));
+        } else if !got.is_some_and(|g| (g - want).abs() <= 0.1) {
+            failures.push(format!("{name}: {got:?} s, wanted {want:.3}"));
+        } else {
+            println!("ok   {name} → mkv: {:.3} s", got.unwrap());
+        }
+        std::fs::remove_file(&outs[0]).unwrap();
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
 
 // ---------------------------------------------------------------------------------------------
