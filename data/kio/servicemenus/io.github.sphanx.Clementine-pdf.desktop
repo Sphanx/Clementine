@@ -1,0 +1,30 @@
+# Clementine service menu for PDF (Dolphin / KDE Frameworks 6).
+# See README.md > File managers.
+[Desktop Entry]
+Type=Service
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
+MimeType=application/pdf;
+Actions=topng;tojpg;totxt;compress;
+X-KDE-Priority=TopLevel
+X-KDE-Submenu=Clementine
+X-KDE-Protocols=file
+
+[Desktop Action topng]
+Name=Convert to PNG
+Icon=io.github.sphanx.Clementine
+Exec=clementine --convert png --notify -- %F
+
+[Desktop Action tojpg]
+Name=Convert to JPG
+Icon=io.github.sphanx.Clementine
+Exec=clementine --convert jpg --notify -- %F
+
+[Desktop Action totxt]
+Name=Convert to TXT
+Icon=io.github.sphanx.Clementine
+Exec=clementine --convert txt --notify -- %F
+
+[Desktop Action compress]
+Name=Compress
+Icon=io.github.sphanx.Clementine
+Exec=clementine --tool compress --notify -- %F

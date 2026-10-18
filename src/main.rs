@@ -9,6 +9,7 @@
 mod actions;
 mod backend;
 mod catalog;
+mod cli;
 mod config;
 mod params;
 mod params_ui;
@@ -66,15 +67,38 @@ fn state() -> Option<Rc<App>> {
 }
 
 fn main() -> glib::ExitCode {
+    // `--convert`, `--tool`, `--list` and `--wheel` are handled before GTK sees the command line.
+    let wheel_files = match cli::main_hook() {
+        cli::Next::Exit(code) => return glib::ExitCode::from(code),
+        cli::Next::Gui => None,
+        cli::Next::Wheel(files) => Some(files),
+    };
     let app = gtk::Application::builder().application_id(APP_ID).flags(gio::ApplicationFlags::HANDLES_OPEN).build();
     app.connect_activate(|app| window(app).present());
-    // `clementine file…` and "Open With" both land here.
-    app.connect_open(|app, files, _| {
+    // `clementine file…` and "Open With" both land here; `--wheel` sends the hint "wheel".
+    app.connect_open(|app, files, hint| {
         window(app).present();
         if let Some(state) = state() {
-            add_to_shelf(&state, files.iter().filter_map(|f| f.path()).collect());
+            let files: Vec<PathBuf> = files.iter().filter_map(|f| f.path()).collect();
+            add_to_shelf(&state, files.clone());
+            if hint == cli::WHEEL_HINT {
+                open_wheel_when_ready(&state, files);
+            }
         }
     });
+    if let Some(files) = wheel_files {
+        // Open through the running instance when there is one, so the wheel appears there.
+        if app.register(gio::Cancellable::NONE).is_err() {
+            return glib::ExitCode::FAILURE;
+        }
+        let gfiles: Vec<gio::File> = files.iter().map(gio::File::for_path).collect();
+        app.open(&gfiles, cli::WHEEL_HINT);
+        if app.is_remote() {
+            return glib::ExitCode::SUCCESS;
+        }
+        let argv0: Vec<String> = std::env::args().take(1).collect();
+        return app.run_with_args(&argv0);
+    }
     app.run()
 }
 
@@ -463,6 +487,31 @@ fn open_keyboard_wheel(state: &App) {
     }
     let mid = (state.overlay.width() as f64 / 2.0, state.overlay.height() as f64 / 2.0);
     open_wheel(state, Mode::Convert, mid, files, true);
+}
+
+/// Opens the keyboard Convert wheel on `files` once the window has a size to centre it in.
+fn open_wheel_when_ready(state: &Rc<App>, files: Vec<PathBuf>) {
+    if files.is_empty() {
+        return;
+    }
+    let weak = Rc::downgrade(state);
+    glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
+        let Some(state) = weak.upgrade() else { return glib::ControlFlow::Break };
+        if state.overlay.width() == 0 {
+            return glib::ControlFlow::Continue;
+        }
+        let shelf = state.shelf_files.borrow().clone();
+        state.shelf.unselect_all();
+        for (i, f) in shelf.iter().enumerate() {
+            if files.contains(f) {
+                state.shelf.select_row(state.shelf.row_at_index(i as i32).as_ref());
+            }
+        }
+        state.window.present();
+        let mid = (state.overlay.width() as f64 / 2.0, state.overlay.height() as f64 / 2.0);
+        open_wheel(&state, Mode::Convert, mid, files.clone(), true);
+        glib::ControlFlow::Break
+    });
 }
 
 fn remove_selected(state: &App) {
