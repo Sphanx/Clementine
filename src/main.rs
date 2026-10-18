@@ -9,6 +9,8 @@
 mod actions;
 mod backend;
 mod catalog;
+mod params;
+mod params_ui;
 mod wheel;
 
 use std::cell::{Cell, RefCell};
@@ -520,7 +522,23 @@ fn execute(state: &Rc<App>, op: Op, files: Vec<PathBuf>) {
         actions::perform(action, files, &state.window, move |msg| status.set_text(&msg));
         return;
     }
+    // Tools like Trim and Crop ask for their settings first.
+    if let Op::Tool(tool) = op
+        && tool.needs_params()
+    {
+        let weak = Rc::downgrade(state);
+        params_ui::ask(state.window.upcast_ref(), tool, files.clone(), move |params| {
+            if let Some(state) = weak.upgrade() {
+                start_job(&state, op, files, Some(params));
+            }
+        });
+        return;
+    }
+    start_job(state, op, files, None);
+}
 
+/// Adds a line to the activity list and runs `op` off the UI thread.
+fn start_job(state: &Rc<App>, op: Op, files: Vec<PathBuf>, params: Option<params::Params>) {
     let what = if files.len() == 1 {
         files[0].file_name().unwrap_or_default().to_string_lossy().into_owned()
     } else {
@@ -543,7 +561,7 @@ fn execute(state: &Rc<App>, op: Op, files: Vec<PathBuf>) {
 
     let state = state.clone();
     glib::spawn_future_local(async move {
-        let result = gio::spawn_blocking(move || backend::run(op, &files)).await;
+        let result = gio::spawn_blocking(move || backend::run(op, &files, params.as_ref())).await;
         line.remove(&spinner);
         match result {
             Ok(Ok(outputs)) => {

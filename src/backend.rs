@@ -8,7 +8,7 @@
 //! is never overwritten.
 
 use std::collections::HashSet;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -16,6 +16,7 @@ use std::sync::Mutex;
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::catalog::{Kind, Op, Tool, canonical, extension, kind_of};
+use crate::params::{self, Crop, Facts, Params, Resize, atempo_chain, speed_name, split_points, trim_number};
 
 /// One external program call.
 #[derive(Debug, Clone)]
@@ -107,7 +108,48 @@ fn magick() -> &'static str {
 }
 
 fn ffmpeg(input: &Path) -> Cmd {
-    Cmd::new("ffmpeg").args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"]).arg(input)
+    ffmpeg_from(input, 0.0)
+}
+
+/// ffmpeg reading `input` from `start` seconds. Seeking before `-i` is fast, and exact
+/// whenever the streams are re-encoded.
+fn ffmpeg_from(input: &Path, start: f64) -> Cmd {
+    let mut cmd = Cmd::new("ffmpeg").args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
+    if start > 0.0 {
+        cmd = cmd.arg("-ss").arg(trim_number(start));
+    }
+    cmd.arg("-i").arg(input)
+}
+
+const X264_HQ: &[&str] =
+    &["-c:v", "libx264", "-crf", "18", "-preset", "medium", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k"];
+
+/// Encoder settings that keep a cut, sped-up or filtered file in its own format, close to its quality.
+fn reencode(input: &Path) -> &'static [&'static str] {
+    let ext = extension(input);
+    let ext = canonical(&ext);
+    match kind_of(input) {
+        Kind::Video => match ext {
+            "mp4" | "m4v" | "mov" | "mkv" => X264_HQ,
+            "webm" | "avi" => ffmpeg_codec(ext),
+            // ffmpeg's defaults for the container.
+            _ => &[],
+        },
+        _ => ffmpeg_codec(ext),
+    }
+}
+
+/// A stream copy cuts at packet boundaries. That is exact only for PCM audio (and keeps its
+/// bit depth); anything compressed is re-encoded so the cut lands where it was asked.
+pub fn copy_is_exact(input: &Path) -> bool {
+    matches!(canonical(&extension(input)), "wav" | "aiff")
+}
+
+/// `len` seconds of `input` from `start`, into `out`.
+fn cut(input: &Path, start: f64, len: f64, out: &Path) -> Cmd {
+    let cmd = ffmpeg_from(input, start).arg("-t").arg(trim_number(len));
+    let cmd = if copy_is_exact(input) { cmd.args(["-c", "copy"]) } else { cmd.args(reencode(input).iter().copied()) };
+    cmd.arg(out)
 }
 
 /// Encoder settings for a conversion target.
@@ -303,7 +345,25 @@ fn pandoc(input: &Path, src: &str, target: &str, out: &Path) -> Cmd {
     cmd.arg("-o").arg(out).arg(input)
 }
 
-fn tool_job(input: &Path, tool: Tool, names: &mut Names) -> Result<Job> {
+/// The settings a tool runs with, and whether durations may be probed (only for a real run;
+/// planning for [`missing_programs`] must stay quick and touch no file).
+struct Setup<'a> {
+    params: Option<Params>,
+    probe: bool,
+    scratch: &'a Path,
+}
+
+impl Setup<'_> {
+    /// `input`'s duration, or a stand-in while only planning.
+    fn duration(&self, input: &Path) -> Result<f64> {
+        if !self.probe {
+            return Ok(1.0);
+        }
+        media_duration(input).ok_or_else(|| anyhow!("could not read the length of {}", input.display()))
+    }
+}
+
+fn tool_job(input: &Path, tool: Tool, setup: &Setup, names: &mut Names) -> Result<Job> {
     let dir = parent(input);
     let name = stem(input);
     let ext = extension(input);
@@ -318,9 +378,27 @@ fn tool_job(input: &Path, tool: Tool, names: &mut Names) -> Result<Job> {
             steps.push(im(&out, &[&["-strip", "-quality", "75"], extra].concat()));
             out
         }
-        Tool::ResizeHalf => {
-            let out = names.claim(&dir, &format!("{name} (50%)"), &ext);
-            steps.push(im(&out, &["-resize", "50%"]));
+        Tool::Resize => {
+            let (label, geometry) = match setup.params {
+                Some(Params::Resize(Resize::Fit { width, height })) => {
+                    (format!("{width}x{height}"), format!("{width}x{height}"))
+                }
+                Some(Params::Resize(Resize::Percent(p))) => (format!("{p}%"), format!("{p}%")),
+                _ => bail!("Resize needs a size"),
+            };
+            let out = names.claim(&dir, &format!("{name} ({label})"), &ext);
+            steps.push(im(&out, &["-resize", &geometry]));
+            out
+        }
+        Tool::CropImage => {
+            // An aspect crop is centred; `+repage` drops the offset the crop leaves behind.
+            let (gravity, geometry) = match setup.params {
+                Some(Params::Crop(Crop::Aspect(a, b))) => ("center", format!("{a}:{b}")),
+                Some(Params::Crop(Crop::Rect { x, y, w, h })) => ("northwest", format!("{w}x{h}+{x}+{y}")),
+                _ => bail!("Crop needs a size"),
+            };
+            let out = names.claim(&dir, &format!("{name} (cropped)"), &ext);
+            steps.push(im(&out, &["-gravity", gravity, "-crop", &geometry, "+repage"]));
             out
         }
         Tool::Rotate90 => {
@@ -366,6 +444,92 @@ fn tool_job(input: &Path, tool: Tool, names: &mut Names) -> Result<Job> {
             steps.push(Step::Run(ffmpeg(input).args(["-c:v", "copy", "-an"]).arg(&out)));
             out
         }
+        Tool::Thumbnail => {
+            let Some(Params::Thumbnail { at }) = setup.params else { bail!("Thumbnail needs a time") };
+            let out = names.claim(&dir, &format!("{name} (thumbnail)"), "jpg");
+            let args = ["-frames:v", "1", "-q:v", "2", "-update", "1"];
+            steps.push(Step::Run(ffmpeg_from(input, at).args(args).arg(&out)));
+            out
+        }
+        Tool::Trim => {
+            let Some(Params::Trim { start, end }) = setup.params else { bail!("Trim needs a range") };
+            let out = names.claim(&dir, &format!("{name} (trimmed)"), &ext);
+            steps.push(Step::Run(cut(input, start, end - start, &out)));
+            out
+        }
+        Tool::SplitMedia => {
+            let Some(Params::Split(by)) = setup.params else { bail!("Split needs a part length") };
+            let out = names.claim(&dir, &format!("{name} (parts)"), "");
+            steps.push(Step::MkDir(out.clone()));
+            let parts = split_points(setup.duration(input)?, by);
+            let width = parts.len().to_string().len();
+            for (i, (start, len)) in parts.into_iter().enumerate() {
+                let part = out.join(format!("{name} {:0width$}.{ext}", i + 1));
+                steps.push(Step::Run(cut(input, start, len, &part)));
+            }
+            out
+        }
+        Tool::Speed => {
+            let Some(Params::Speed(f)) = setup.params else { bail!("Speed needs a factor") };
+            let out = names.claim(&dir, &format!("{name} ({})", speed_name(f)), &ext);
+            let mut cmd = ffmpeg(input);
+            if kind_of(input) == Kind::Video {
+                // Passthrough keeps every frame at its new time; the default constant frame rate
+                // drops or repeats frames and lands up to a few frames off the asked length.
+                cmd = cmd
+                    .arg("-filter:v")
+                    .arg(format!("setpts=PTS/{}", trim_number(f)))
+                    .args(["-fps_mode", "passthrough"]);
+            }
+            cmd = cmd.arg("-filter:a").arg(atempo_chain(f)).args(reencode(input).iter().copied());
+            steps.push(Step::Run(cmd.arg(&out)));
+            out
+        }
+        Tool::FadeAudio => {
+            let Some(Params::Fade { fade_in, fade_out }) = setup.params else { bail!("Fade needs lengths") };
+            let mut fades = Vec::new();
+            if fade_in > 0.0 {
+                fades.push(format!("afade=t=in:st=0:d={}", trim_number(fade_in)));
+            }
+            if fade_out > 0.0 {
+                let from = (setup.duration(input)? - fade_out).max(0.0);
+                fades.push(format!("afade=t=out:st={}:d={}", trim_number(from), trim_number(fade_out)));
+            }
+            let out = names.claim(&dir, &format!("{name} (faded)"), &ext);
+            let cmd = ffmpeg(input).arg("-filter:a").arg(fades.join(",")).args(reencode(input).iter().copied());
+            steps.push(Step::Run(cmd.arg(&out)));
+            out
+        }
+        Tool::MonoAudio => {
+            let out = names.claim(&dir, &format!("{name} (mono)"), &ext);
+            steps.push(Step::Run(ffmpeg(input).args(["-ac", "1"]).args(reencode(input).iter().copied()).arg(&out)));
+            out
+        }
+        Tool::RotatePdf => {
+            let Some(Params::RotatePages(angle)) = setup.params else { bail!("Rotate needs an angle") };
+            let out = names.claim(&dir, &format!("{name} (rotated)"), "pdf");
+            let cmd = Cmd::new("qpdf").arg("--warning-exit-0").arg(input).arg(format!("--rotate=+{angle}")).arg(&out);
+            steps.push(Step::Run(cmd));
+            out
+        }
+        Tool::ExtractPages => {
+            let Some(Params::Pages { first, last }) = setup.params else { bail!("Pages needs a range") };
+            let range = if first == last { format!("page {first}") } else { format!("pages {first}-{last}") };
+            let out = names.claim(&dir, &format!("{name} ({range})"), "pdf");
+            if has_program("qpdf") {
+                let cmd = Cmd::new("qpdf").args(["--warning-exit-0", "--empty", "--pages"]).arg(input);
+                steps.push(Step::Run(cmd.arg(format!("{first}-{last}")).arg("--").arg(&out)));
+            } else {
+                // poppler: one file per page, then joined back together.
+                let pages = setup.scratch.join(format!("pages-{name}"));
+                steps.push(Step::MkDir(pages.clone()));
+                let separate = Cmd::new("pdfseparate").arg("-f").arg(first.to_string()).arg("-l").arg(last.to_string());
+                steps.push(Step::Run(separate.arg(input).arg(pages.join("p-%d.pdf"))));
+                let unite = Cmd::new("pdfunite").args((first..=last).map(|n| pages.join(format!("p-{n}.pdf"))));
+                steps.push(Step::Run(unite.arg(&out)));
+            }
+            out
+        }
         Tool::CompressAudio => {
             let out = names.claim(&dir, &format!("{name} (compressed)"), "mp3");
             steps.push(Step::Run(ffmpeg(input).args(["-vn", "-c:a", "libmp3lame", "-b:a", "128k"]).arg(&out)));
@@ -402,7 +566,11 @@ fn tool_job(input: &Path, tool: Tool, names: &mut Names) -> Result<Job> {
 }
 
 /// Plans every job for `op`. `scratch` is a private folder for intermediate files.
-pub fn plan(op: Op, files: &[PathBuf], scratch: &Path) -> Result<Vec<Job>> {
+///
+/// `params` are the settings of a tool that asks for them ([`Tool::needs_params`]). With them,
+/// tools that need a file's length probe it with ffprobe. Without them, a tool that asks is
+/// planned with stand-in settings, only to learn which programs it calls.
+pub fn plan(op: Op, files: &[PathBuf], params: Option<&Params>, scratch: &Path) -> Result<Vec<Job>> {
     // Inputs are claimed up front, so no output can ever be named after one.
     let mut names = Names { taken: files.iter().cloned().collect() };
     let first = files.first().ok_or_else(|| anyhow!("nothing selected"))?;
@@ -426,22 +594,34 @@ pub fn plan(op: Op, files: &[PathBuf], scratch: &Path) -> Result<Vec<Job>> {
             cmd.cwd = Some(dir);
             Ok(vec![Job { steps: vec![Step::Run(cmd)], outputs: vec![out] }])
         }
-        Op::Tool(tool) => files.iter().map(|f| tool_job(f, tool, &mut names)).collect(),
+        Op::Tool(tool) => {
+            let setup = Setup {
+                params: params.copied().or_else(|| params::defaults(tool, &Facts::default())),
+                probe: params.is_some(),
+                scratch,
+            };
+            files.iter().map(|f| tool_job(f, tool, &setup, &mut names)).collect()
+        }
         Op::Action(_) => bail!("actions are handled by the window"),
     }
 }
 
 /// The programs `op` would call that are not installed. Empty means it can run.
 pub fn missing_programs(op: Op, files: &[PathBuf]) -> Vec<String> {
-    let Ok(jobs) = plan(op, files, Path::new("/nonexistent-scratch")) else { return Vec::new() };
-    let mut missing: Vec<String> = jobs
+    let Ok(jobs) = plan(op, files, None, Path::new("/nonexistent-scratch")) else { return Vec::new() };
+    let mut programs: Vec<String> = jobs
         .iter()
         .flat_map(|j| &j.steps)
         .filter_map(|s| match s {
-            Step::Run(c) if !has_program(&c.program) => Some(c.program.clone()),
+            Step::Run(c) => Some(c.program.clone()),
             _ => None,
         })
         .collect();
+    // These read the file's length before they plan.
+    if matches!(op, Op::Tool(Tool::SplitMedia | Tool::FadeAudio)) {
+        programs.push("ffprobe".into());
+    }
+    let mut missing: Vec<String> = programs.into_iter().filter(|p| !has_program(p)).collect();
     missing.sort();
     missing.dedup();
     missing
@@ -492,10 +672,17 @@ fn run_step(step: &Step) -> Result<()> {
 
 /// Runs `op` on `files` and returns what it produced. Blocks: call it off the UI thread.
 /// A job that fails leaves nothing behind; earlier, successful jobs are kept.
-pub fn run(op: Op, files: &[PathBuf]) -> Result<Vec<PathBuf>> {
+/// `params` are the settings of a tool that asks for them.
+pub fn run(op: Op, files: &[PathBuf], params: Option<&Params>) -> Result<Vec<PathBuf>> {
+    if let Op::Tool(tool) = op
+        && tool.needs_params()
+        && params.is_none()
+    {
+        bail!("{} needs settings", op.label());
+    }
     let scratch = tempfile::Builder::new().prefix("clementine-").tempdir()?;
     let mut produced = Vec::new();
-    for job in plan(op, files, scratch.path())? {
+    for job in plan(op, files, params, scratch.path())? {
         if let Err(e) = job.steps.iter().try_for_each(run_step) {
             for out in &job.outputs {
                 let _ = if out.is_dir() { std::fs::remove_dir_all(out) } else { std::fs::remove_file(out) };
@@ -505,6 +692,61 @@ pub fn run(op: Op, files: &[PathBuf]) -> Result<Vec<PathBuf>> {
         produced.extend(job.outputs);
     }
     Ok(produced)
+}
+
+/// Runs a probe and returns its trimmed stdout, or `None` if it failed.
+fn capture(program: &str, args: &[&OsStr]) -> Option<String> {
+    let out = Command::new(program).args(args).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// A media file's length in seconds, from ffprobe.
+pub fn media_duration(path: &Path) -> Option<f64> {
+    let args = ["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1"].map(OsStr::new);
+    let text = capture("ffprobe", &[&args[..], &[path.as_os_str()]].concat())?;
+    text.lines().next()?.trim().parse().ok().filter(|d: &f64| d.is_finite() && *d > 0.0)
+}
+
+/// An image's width and height as the tools see it: first frame, upright.
+pub fn image_size(path: &Path) -> Option<(u32, u32)> {
+    let mut first = path.as_os_str().to_owned();
+    first.push("[0]");
+    let args = [
+        first.as_os_str(),
+        OsStr::new("-auto-orient"),
+        OsStr::new("-format"),
+        OsStr::new("%w %h"),
+        OsStr::new("info:"),
+    ];
+    let text = capture(magick(), &args)?;
+    let (w, h) = text.split_once(' ')?;
+    Some((w.parse().ok()?, h.parse().ok()?))
+}
+
+/// A PDF's page count, from pdfinfo or qpdf.
+pub fn pdf_page_count(path: &Path) -> Option<u32> {
+    if let Some(info) = capture("pdfinfo", &[path.as_os_str()]) {
+        let line = info.lines().find_map(|l| l.strip_prefix("Pages:"))?;
+        return line.trim().parse().ok();
+    }
+    capture("qpdf", &[OsStr::new("--show-npages"), path.as_os_str()])?.parse().ok()
+}
+
+/// What the settings dialog for `tool` needs to know about `files`. Blocks on ffprobe and friends.
+pub fn facts(tool: Tool, files: &[PathBuf]) -> Facts {
+    let min_f = |v: Vec<f64>| v.into_iter().reduce(f64::min);
+    match tool {
+        Tool::Trim | Tool::SplitMedia | Tool::Thumbnail | Tool::FadeAudio | Tool::Speed => {
+            let durations: Option<Vec<f64>> = files.iter().map(|f| media_duration(f)).collect();
+            Facts { duration: durations.and_then(min_f), ..Facts::default() }
+        }
+        Tool::CropImage | Tool::Resize => Facts { size: files.first().and_then(|f| image_size(f)), ..Facts::default() },
+        Tool::ExtractPages | Tool::RotatePdf => {
+            let pages: Option<Vec<u32>> = files.iter().map(|f| pdf_page_count(f)).collect();
+            Facts { pages: pages.and_then(|p| p.into_iter().min()), ..Facts::default() }
+        }
+        _ => Facts::default(),
+    }
 }
 
 /// Strips cue numbers, timings, WebVTT headers and inline tags, keeping only the spoken lines.
@@ -574,6 +816,50 @@ mod tests {
         assert_eq!(subtitle_text(vtt), "Hello there\nGeneral Kenobi\n");
     }
 
+    fn args_of(op: Op, file: &str, params: Params) -> Vec<String> {
+        let file = PathBuf::from(format!("/nonexistent/{file}"));
+        let setup = Setup { params: Some(params), probe: false, scratch: Path::new("/s") };
+        let Op::Tool(tool) = op else { unreachable!() };
+        let job = tool_job(&file, tool, &setup, &mut Names::default()).unwrap();
+        job.steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::Run(c) => Some(c.args.iter().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    #[test]
+    fn trims_copy_only_pcm() {
+        let range = Params::Trim { start: 1.5, end: 4.0 };
+        let wav = args_of(Op::Tool(Tool::Trim), "a.wav", range);
+        assert!(wav.windows(2).any(|w| w == ["-c", "copy"]), "{wav:?}");
+        let mp4 = args_of(Op::Tool(Tool::Trim), "a.mp4", range);
+        assert!(mp4.windows(2).any(|w| w == ["-ss", "1.5"]) && mp4.windows(2).any(|w| w == ["-t", "2.5"]), "{mp4:?}");
+        assert!(mp4.iter().any(|a| a == "libx264") && !mp4.iter().any(|a| a == "copy"), "{mp4:?}");
+        assert!(mp4.last().unwrap().ends_with("a (trimmed).mp4"));
+    }
+
+    #[test]
+    fn splits_make_one_cut_per_part() {
+        let files = vec![PathBuf::from("/nonexistent/a.mp3")];
+        let params = Params::Split(params::SplitBy::Parts(4));
+        let jobs = plan(Op::Tool(Tool::SplitMedia), &files, None, Path::new("/s")).unwrap();
+        assert_eq!(jobs[0].outputs, vec![PathBuf::from("/nonexistent/a (parts)")]);
+        let setup = Setup { params: Some(params), probe: false, scratch: Path::new("/s") };
+        let job = tool_job(&files[0], Tool::SplitMedia, &setup, &mut Names::default()).unwrap();
+        let cuts = job.steps.iter().filter(|s| matches!(s, Step::Run(_))).count();
+        assert_eq!(cuts, 4);
+    }
+
+    #[test]
+    fn asking_tools_refuse_to_run_without_settings() {
+        let err = run(Op::Tool(Tool::Trim), &[PathBuf::from("/nonexistent/a.mp3")], None).unwrap_err();
+        assert!(err.to_string().contains("needs settings"));
+    }
+
     #[test]
     fn every_offered_op_plans() {
         let samples = [
@@ -585,7 +871,7 @@ mod tests {
             let files = vec![PathBuf::from(format!("/nonexistent/{s}"))];
             for mode in [Mode::Convert, Mode::Tools] {
                 for op in options(mode, &files) {
-                    let jobs = plan(op, &files, scratch).unwrap_or_else(|e| panic!("{s} {op:?}: {e}"));
+                    let jobs = plan(op, &files, None, scratch).unwrap_or_else(|e| panic!("{s} {op:?}: {e}"));
                     assert!(!jobs.is_empty() && !jobs[0].outputs.is_empty(), "{s} {op:?}");
                     assert!(jobs[0].outputs.iter().all(|o| o != &files[0]), "{s} {op:?} overwrites its input");
                 }
@@ -610,13 +896,13 @@ mod real {
         let ff = ["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"];
         sh(magick(), &["-size", "64x48", "gradient:orange-white", "photo.png"], dir);
         sh(magick(), &["-size", "64x48", "xc:orange", "anim.gif"], dir);
-        sh("ffmpeg", &[&ff[..], &["sine=frequency=440:duration=1", "tone.wav"]].concat(), dir);
+        sh("ffmpeg", &[&ff[..], &["sine=frequency=440:duration=1", "-ac", "2", "tone.wav"]].concat(), dir);
         sh(
             "ffmpeg",
             &[
                 &ff[..],
                 &[
-                    "testsrc=size=128x96:rate=10:duration=1",
+                    "testsrc=size=128x96:rate=25:duration=1",
                     "-f",
                     "lavfi",
                     "-i",
@@ -635,7 +921,8 @@ mod real {
         std::fs::write(dir.join("subs.srt"), "1\n00:00:01,000 --> 00:00:02,000\nHello\n").unwrap();
         sh("pandoc", &["notes.md", "-o", "letter.docx"], dir);
         sh("pandoc", &["notes.md", "-s", "-o", "letter.rtf"], dir);
-        sh(magick(), &["photo.png", "doc.pdf"], dir);
+        sh(magick(), &["photo.png", "photo.png", "photo.png", "doc.pdf"], dir);
+        sh("ffmpeg", &["-hide_banner", "-loglevel", "error", "-i", "tone.wav", "tone.mp3"], dir);
         sh("zip", &["-q", "bundle.zip", "notes.md", "table.csv"], dir);
         sh("tar", &["-czf", "bundle.tar.gz", "notes.md"], dir);
         let slides = dir.join("deck.odp");
@@ -646,6 +933,7 @@ mod real {
             "photo.png",
             "anim.gif",
             "tone.wav",
+            "tone.mp3",
             "clip.mp4",
             "notes.md",
             "table.csv",
@@ -665,6 +953,92 @@ mod real {
         all
     }
 
+    /// What a tool's output must look like on the 1-second, 64×48 and 3-page samples.
+    #[derive(Clone, Copy, Debug)]
+    enum Expect {
+        /// Not checked beyond being non-empty.
+        Anything,
+        /// One media file this many seconds long.
+        Seconds(f64),
+        /// A folder of this many media parts, each this long.
+        Parts(usize, f64),
+        Pixels(u32, u32),
+        Pages(u32),
+        Rotation(u32),
+        Channels(u32),
+    }
+
+    /// The settings each asking tool runs with here, and what each must produce.
+    fn cases(tool: Tool) -> Vec<(Params, Expect)> {
+        use params::SplitBy;
+        match tool {
+            Tool::Trim => vec![(Params::Trim { start: 0.25, end: 0.75 }, Expect::Seconds(0.5))],
+            Tool::SplitMedia => vec![
+                (Params::Split(SplitBy::Parts(2)), Expect::Parts(2, 0.5)),
+                (Params::Split(SplitBy::Every(0.4)), Expect::Parts(3, 0.4)),
+            ],
+            Tool::Speed => vec![(Params::Speed(2.0), Expect::Seconds(0.5)), (Params::Speed(0.5), Expect::Seconds(2.0))],
+            Tool::FadeAudio => vec![(Params::Fade { fade_in: 0.2, fade_out: 0.3 }, Expect::Seconds(1.0))],
+            Tool::Thumbnail => vec![(Params::Thumbnail { at: 0.5 }, Expect::Pixels(128, 96))],
+            Tool::CropImage => vec![
+                (Params::Crop(Crop::Aspect(1, 1)), Expect::Pixels(48, 48)),
+                (Params::Crop(Crop::Rect { x: 8, y: 8, w: 32, h: 16 }), Expect::Pixels(32, 16)),
+            ],
+            Tool::Resize => vec![
+                (Params::Resize(Resize::Percent(50)), Expect::Pixels(32, 24)),
+                (Params::Resize(Resize::Fit { width: 40, height: 40 }), Expect::Pixels(40, 30)),
+            ],
+            Tool::RotatePdf => vec![(Params::RotatePages(90), Expect::Rotation(90))],
+            Tool::ExtractPages => vec![(Params::Pages { first: 2, last: 3 }, Expect::Pages(2))],
+            _ => Vec::new(),
+        }
+    }
+
+    fn near(what: &Path, got: Option<f64>, want: f64) -> Result<(), String> {
+        // ffmpeg rounds to whole frames (0.1 s at 10 fps) and audio packets.
+        match got {
+            Some(g) if (g - want).abs() <= 0.12 => Ok(()),
+            _ => Err(format!("{} lasts {got:?} s, wanted {want}", what.display())),
+        }
+    }
+
+    fn check(outs: &[PathBuf], expect: Expect) -> Result<(), String> {
+        let out = outs.first().ok_or("no output")?;
+        match expect {
+            Expect::Anything => Ok(()),
+            Expect::Seconds(s) => near(out, media_duration(out), s),
+            Expect::Parts(n, each) => {
+                let mut parts: Vec<PathBuf> = std::fs::read_dir(out).unwrap().map(|e| e.unwrap().path()).collect();
+                parts.sort();
+                if parts.len() != n {
+                    return Err(format!("{} parts, wanted {n}: {parts:?}", parts.len()));
+                }
+                // The last part of an uneven split holds what is left.
+                parts[..n - 1].iter().try_for_each(|p| near(p, media_duration(p), each))
+            }
+            Expect::Pixels(w, h) => match image_size(out) {
+                Some(got) if got == (w, h) => Ok(()),
+                got => Err(format!("{} is {got:?}, wanted {w}x{h}", out.display())),
+            },
+            Expect::Pages(n) => match pdf_page_count(out) {
+                Some(got) if got == n => Ok(()),
+                got => Err(format!("{got:?} pages, wanted {n}")),
+            },
+            Expect::Rotation(r) => {
+                let info = capture("pdfinfo", &[out.as_os_str()]).unwrap_or_default();
+                let rot = info.lines().find_map(|l| l.strip_prefix("Page rot:")).map(str::trim);
+                if rot == Some(r.to_string().as_str()) { Ok(()) } else { Err(format!("page rotation {rot:?}")) }
+            }
+            Expect::Channels(n) => {
+                let args =
+                    ["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=channels", "-of", "csv=p=0"]
+                        .map(OsStr::new);
+                let got = capture("ffprobe", &[&args[..], &[out.as_os_str()]].concat());
+                if got.as_deref() == Some(n.to_string().as_str()) { Ok(()) } else { Err(format!("{got:?} channels")) }
+            }
+        }
+    }
+
     #[test]
     #[ignore]
     fn every_op_on_real_files() {
@@ -680,18 +1054,33 @@ mod real {
                     println!("skip {name}: needs {}", missing.join(", "));
                     continue;
                 }
-                ran += 1;
-                match run(op, &files) {
-                    Ok(outs)
-                        if outs.iter().all(|o| {
-                            o.is_dir() && std::fs::read_dir(o).unwrap().next().is_some()
-                                || o.metadata().is_ok_and(|m| m.len() > 0)
-                        }) =>
-                    {
-                        println!("ok   {name}")
+                let runs: Vec<(Option<Params>, Expect)> = match op {
+                    Op::Tool(Tool::MonoAudio) => vec![(None, Expect::Channels(1))],
+                    Op::Tool(t) if t.needs_params() => cases(t).into_iter().map(|(p, e)| (Some(p), e)).collect(),
+                    _ => vec![(None, Expect::Anything)],
+                };
+                assert!(!runs.is_empty(), "{name} asks for settings but has no test case");
+                for (params, expect) in runs {
+                    let name = match params {
+                        Some(p) => format!("{name} {p:?}"),
+                        None => name.clone(),
+                    };
+                    ran += 1;
+                    match run(op, &files, params.as_ref()) {
+                        Ok(outs)
+                            if outs.iter().all(|o| {
+                                o.is_dir() && std::fs::read_dir(o).unwrap().next().is_some()
+                                    || o.metadata().is_ok_and(|m| m.len() > 0)
+                            }) =>
+                        {
+                            match check(&outs, expect) {
+                                Ok(()) => println!("ok   {name}"),
+                                Err(e) => failures.push(format!("{name}: {e}")),
+                            }
+                        }
+                        Ok(outs) => failures.push(format!("{name}: empty output {outs:?}")),
+                        Err(e) => failures.push(format!("{name}: {e:#}")),
                     }
-                    Ok(outs) => failures.push(format!("{name}: empty output {outs:?}")),
-                    Err(e) => failures.push(format!("{name}: {e:#}")),
                 }
             }
         }

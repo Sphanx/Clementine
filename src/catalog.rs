@@ -47,22 +47,61 @@ impl Mode {
 }
 
 /// A file tool: changes the file but keeps (mostly) its format.
+///
+/// Tools whose label ends in `…` ask for settings first (see [`Tool::needs_params`]
+/// and [`crate::params`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
     CompressImage,
-    ResizeHalf,
+    /// Scale by a percentage or fit inside a box.
+    Resize,
+    /// A centred aspect ratio, or an exact rectangle.
+    CropImage,
     Rotate90,
     StripMetadata,
     CompressVideo,
     HalfResVideo,
     MuteVideo,
+    /// One JPG frame at a chosen time.
+    Thumbnail,
     CompressAudio,
     NormalizeAudio,
+    MonoAudio,
+    /// Fade audio in and/or out.
+    FadeAudio,
+    /// Audio or video: keep a start–end range.
+    Trim,
+    /// Audio or video: N equal parts, or a part every X seconds.
+    SplitMedia,
+    /// Audio or video: play faster or slower.
+    Speed,
     CompressPdf,
     SplitPdf,
     MergePdf,
+    /// A page range of a PDF, as a new PDF.
+    ExtractPages,
+    /// Turn every page of a PDF.
+    RotatePdf,
     Extract,
     Zip,
+}
+
+impl Tool {
+    /// Whether the tool asks for settings (a [`crate::params::Params`]) before it runs.
+    pub fn needs_params(self) -> bool {
+        matches!(
+            self,
+            Tool::Resize
+                | Tool::CropImage
+                | Tool::Thumbnail
+                | Tool::FadeAudio
+                | Tool::Trim
+                | Tool::SplitMedia
+                | Tool::Speed
+                | Tool::ExtractPages
+                | Tool::RotatePdf
+        )
+    }
 }
 
 /// A file action: works on anything, folders included, and converts nothing.
@@ -91,13 +130,22 @@ impl Op {
             Op::Convert(ext) => ext.to_uppercase(),
             Op::Tool(t) => match t {
                 Tool::CompressImage | Tool::CompressVideo | Tool::CompressAudio | Tool::CompressPdf => "Compress",
-                Tool::ResizeHalf => "Resize 50%",
+                Tool::Resize => "Resize…",
+                Tool::CropImage => "Crop…",
                 Tool::Rotate90 => "Rotate",
                 Tool::StripMetadata => "Strip metadata",
                 Tool::HalfResVideo => "Half size",
                 Tool::MuteVideo => "Mute",
+                Tool::Thumbnail => "Thumbnail…",
                 Tool::NormalizeAudio => "Normalize",
+                Tool::MonoAudio => "Mono",
+                Tool::FadeAudio => "Fade…",
+                Tool::Trim => "Trim…",
+                Tool::SplitMedia => "Split…",
+                Tool::Speed => "Speed…",
                 Tool::SplitPdf => "Split pages",
+                Tool::ExtractPages => "Pages…",
+                Tool::RotatePdf => "Rotate…",
                 Tool::MergePdf => "Merge",
                 Tool::Extract => "Extract",
                 Tool::Zip => "Zip",
@@ -215,11 +263,31 @@ pub fn options(mode: Mode, files: &[PathBuf]) -> Vec<Op> {
         }
         Mode::Tools => {
             let mut ops: Vec<Op> = match common_kind(files) {
-                Some(Kind::Image) => vec![Tool::CompressImage, Tool::ResizeHalf, Tool::Rotate90, Tool::StripMetadata],
-                Some(Kind::Video) => vec![Tool::CompressVideo, Tool::HalfResVideo, Tool::MuteVideo],
-                Some(Kind::Audio) => vec![Tool::CompressAudio, Tool::NormalizeAudio],
-                Some(Kind::Pdf) if files.len() > 1 => vec![Tool::MergePdf, Tool::CompressPdf, Tool::SplitPdf],
-                Some(Kind::Pdf) => vec![Tool::CompressPdf, Tool::SplitPdf],
+                Some(Kind::Image) => {
+                    vec![Tool::CompressImage, Tool::Resize, Tool::CropImage, Tool::Rotate90, Tool::StripMetadata]
+                }
+                Some(Kind::Video) => vec![
+                    Tool::CompressVideo,
+                    Tool::Trim,
+                    Tool::SplitMedia,
+                    Tool::Speed,
+                    Tool::Thumbnail,
+                    Tool::HalfResVideo,
+                    Tool::MuteVideo,
+                ],
+                Some(Kind::Audio) => vec![
+                    Tool::CompressAudio,
+                    Tool::Trim,
+                    Tool::SplitMedia,
+                    Tool::Speed,
+                    Tool::FadeAudio,
+                    Tool::NormalizeAudio,
+                    Tool::MonoAudio,
+                ],
+                Some(Kind::Pdf) if files.len() > 1 => {
+                    vec![Tool::MergePdf, Tool::CompressPdf, Tool::SplitPdf, Tool::ExtractPages, Tool::RotatePdf]
+                }
+                Some(Kind::Pdf) => vec![Tool::CompressPdf, Tool::SplitPdf, Tool::ExtractPages, Tool::RotatePdf],
                 Some(Kind::Archive) => vec![Tool::Extract],
                 _ => Vec::new(),
             }
@@ -276,5 +344,27 @@ mod tests {
     fn merge_needs_two_pdfs() {
         assert!(!options(Mode::Tools, &[p("a.pdf")]).contains(&Op::Tool(Tool::MergePdf)));
         assert!(options(Mode::Tools, &[p("a.pdf"), p("b.pdf")]).contains(&Op::Tool(Tool::MergePdf)));
+    }
+
+    #[test]
+    fn media_tools_follow_the_kind() {
+        let video = options(Mode::Tools, &[p("a.mp4")]);
+        let audio = options(Mode::Tools, &[p("a.flac")]);
+        for t in [Tool::Trim, Tool::SplitMedia, Tool::Speed] {
+            assert!(video.contains(&Op::Tool(t)) && audio.contains(&Op::Tool(t)), "{t:?}");
+        }
+        assert!(video.contains(&Op::Tool(Tool::Thumbnail)) && !audio.contains(&Op::Tool(Tool::Thumbnail)));
+        assert!(audio.contains(&Op::Tool(Tool::FadeAudio)) && !video.contains(&Op::Tool(Tool::FadeAudio)));
+        assert!(options(Mode::Tools, &[p("a.png")]).contains(&Op::Tool(Tool::CropImage)));
+    }
+
+    #[test]
+    fn asking_tools_say_so_in_their_label() {
+        for files in [[p("a.png")], [p("a.mp4")], [p("a.mp3")], [p("a.pdf")]] {
+            for op in options(Mode::Tools, &files) {
+                let Op::Tool(t) = op else { continue };
+                assert_eq!(t.needs_params(), op.label().ends_with('…'), "{t:?}");
+            }
+        }
     }
 }
