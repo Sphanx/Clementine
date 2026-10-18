@@ -32,7 +32,7 @@ const APP_ID: &str = "io.github.sphanx.Clementine";
 const CSS: &str = r#"
 .drop-hint { font-size: 1.4em; font-weight: bold; opacity: 0.8; }
 .chip { padding: 6px 14px; border-radius: 999px; background: alpha(currentColor, 0.08); font-weight: bold; }
-.chip.hot { background: @accent_bg_color; color: @accent_fg_color; }
+.chip.hot { background: #6b5b95; color: white; }
 .dim { opacity: 0.6; }
 .section { font-weight: bold; opacity: 0.7; margin: 8px 12px 2px 12px; }
 .error { color: @error_color; }
@@ -711,6 +711,7 @@ fn shelf_row(file: &Path) -> gtk::ListBoxRow {
     line.append(&text);
     let row = gtk::ListBoxRow::new();
     row.set_child(Some(&line));
+    row.update_property(&[gtk::accessible::Property::Label(&file.file_name().unwrap_or_default().to_string_lossy())]);
 
     // Shelf rows drag out to file managers, or back onto the window to open a wheel.
     let source = gtk::DragSource::new();

@@ -346,8 +346,20 @@ pub struct Palette {
     pub high_contrast: bool,
 }
 
+/// Clementine's accent: a muted purple. White on it is 5.9:1.
+pub const ACCENT_LIGHT: Rgb = Rgb(0x6b as f64 / 255.0, 0x5b as f64 / 255.0, 0x95 as f64 / 255.0);
+/// A lighter muted purple for dark themes. White on it is only 3.8:1, so its label is black (5.5:1).
+pub const ACCENT_DARK: Rgb = Rgb(0x8a as f64 / 255.0, 0x7b as f64 / 255.0, 0xb0 as f64 / 255.0);
+
+/// Black or white, whichever reads better on `bg`.
+fn best_text(bg: Rgb) -> Rgb {
+    if contrast(Rgb::WHITE, bg) >= contrast(Rgb::BLACK, bg) { Rgb::WHITE } else { Rgb::BLACK }
+}
+
 /// Builds the palette from theme colours. `fg_alpha` is the alpha of the theme's text colour
 /// (Adwaita draws text at 80 % black). Missing theme colours fall back to neutral ones.
+/// The selection is Clementine's purple accent; only a high-contrast theme's own accent
+/// (`accent`, `on_accent`) replaces it.
 pub fn palette(
     fg: Rgb,
     fg_alpha: f64,
@@ -359,8 +371,12 @@ pub fn palette(
     let light_text = luminance(fg) > 0.4;
     let disc = bg.unwrap_or(if light_text { Rgb(0.16, 0.16, 0.17) } else { Rgb(0.98, 0.98, 0.98) });
     let text = readable(mix(disc, fg, fg_alpha), disc, MIN_CONTRAST);
-    let accent = accent.unwrap_or(Rgb(0.208, 0.518, 0.894));
-    let on_accent = on_accent.unwrap_or_else(|| readable(Rgb::WHITE, accent, MIN_CONTRAST));
+    let dark = luminance(disc) < 0.2;
+    let (accent, on_accent) = match (high_contrast, accent) {
+        (true, Some(a)) => (a, on_accent.unwrap_or_else(|| best_text(a))),
+        _ if dark => (ACCENT_DARK, best_text(ACCENT_DARK)),
+        _ => (ACCENT_LIGHT, Rgb::WHITE),
+    };
     let (accent, on_accent) = readable_pair(accent, on_accent, MIN_CONTRAST);
     Palette {
         disc,
@@ -564,6 +580,7 @@ fn can_announce(area: &gtk::DrawingArea) -> bool {
 /// Shows or hides the wheel's area, keeps its accessible name and description current, and
 /// announces whatever changed (GTK 4.14 `gtk_accessible_announce`).
 pub fn sync(area: &gtk::DrawingArea, wheel: &mut Wheel) {
+    let appearing = wheel.open && !area.is_visible();
     area.set_visible(wheel.open);
     if wheel.open {
         let description = match wheel.selection_text() {
@@ -577,7 +594,15 @@ pub fn sync(area: &gtk::DrawingArea, wheel: &mut Wheel) {
         if let Some(text) = wheel.speech()
             && can_announce(area)
         {
-            area.announce(&text, gtk::AccessibleAnnouncementPriority::Medium);
+            if appearing {
+                // A widget that was hidden has no AT-SPI object yet; speak once it has.
+                let area = area.clone();
+                gtk::glib::idle_add_local_once(move || {
+                    area.announce(&text, gtk::AccessibleAnnouncementPriority::Medium)
+                });
+            } else {
+                area.announce(&text, gtk::AccessibleAnnouncementPriority::Medium);
+            }
         }
     } else {
         wheel.speech();
@@ -728,9 +753,16 @@ mod tests {
                 contrast(p.on_accent, p.accent)
             );
         }
-        // A theme that already passes keeps its colours.
-        let dark = palette(Rgb::WHITE, 1.0, Some(hex(0x383838)), Some(hex(0x1c71d8)), Some(Rgb::WHITE), false);
-        assert_eq!(dark.accent, hex(0x1c71d8));
+        // The purple accent, as the owner chose it: unchanged, because it already passes.
+        let light = &cases[0].1;
+        assert_eq!((light.accent, light.on_accent), (hex(0x6b5b95), Rgb::WHITE));
+        assert!(contrast(Rgb::WHITE, hex(0x6b5b95)) > 5.8);
+        let dark = &cases[1].1;
+        assert_eq!((dark.accent, dark.on_accent), (hex(0x8a7bb0), Rgb::BLACK));
+        assert!(contrast(Rgb::BLACK, hex(0x8a7bb0)) >= MIN_CONTRAST);
+        assert!(contrast(Rgb::WHITE, hex(0x8a7bb0)) < MIN_CONTRAST); // why its label is black
         assert_eq!(dark.text, Rgb::WHITE);
+        // High contrast keeps the theme's own selection colour.
+        assert_eq!(cases[2].1.accent, hex(0x1c71d8));
     }
 }
