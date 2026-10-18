@@ -10,6 +10,7 @@ mod actions;
 mod backend;
 mod catalog;
 mod config;
+mod messages;
 mod params;
 mod params_ui;
 mod settings_ui;
@@ -607,7 +608,7 @@ fn start_job(state: &Rc<App>, op: Op, files: Vec<PathBuf>, params: Option<params
                 err.add_css_class("error");
                 err.set_tooltip_text(Some(&format!("{e:#}")));
                 line.append(&err);
-                state.status.set_text(&format!("{e:#}"));
+                state.status.set_text(&messages::headline(&format!("{e:#}")));
             }
             Err(_) => state.status.set_text("The converter crashed"),
         }
