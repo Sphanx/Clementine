@@ -8,6 +8,7 @@ description = "Offline drag-and-drop file converter for Linux"
 [dependencies]
 anyhow = "1.0.104"
 gtk = { version = "0.11", package = "gtk4", features = ["v4_14"] }
+pangocairo = "0.22"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tempfile = "3.27.0"

@@ -23,9 +23,25 @@ A drop without a wheel puts the files on the **shelf**.
 So while dragging, three chips appear at the bottom of the window; drag over one to open its wheel.
 Modifier keys work when dragging from the shelf, and on X11.
 
-**Keyboard:** select files on the shelf and press **Enter**. Arrows choose a slice, **Tab** switches
-wheels, **Enter** runs, **Esc** cancels. **Delete** removes files from the shelf. Shelf rows can be
-dragged out to a file manager or back onto the window.
+**Keyboard:** select files on the shelf and press **Enter** (or the **Menu** key, or **Shift+F10**).
+Arrows choose a slice, **Home**/**End** jump to the first/last one, **1**–**9** run slice N directly,
+**Tab** switches wheels, **Enter** runs, **Esc** cancels; focus then returns to the shelf row.
+**Delete** removes files from the shelf. Shelf rows can be dragged out to a file manager or back onto
+the window.
+
+**Mouse or touch, no modifier keys:** right-click (or long-press) a shelf row to open the wheel there.
+Click a slice to run it; click anywhere else to cancel.
+
+**Screen readers:** the open wheel is exposed to Orca and other AT-SPI tools as a menu named after it
+("Convert wheel, 7 options"); its description and a spoken announcement follow the selection
+("PNG, 2 of 7", or "WEBP, 3 of 7, unavailable: needs ffmpeg").
+
+**Looks:** the wheel uses the system font and text size (it grows with large text), the theme's
+colours (light, dark and high contrast), and a muted purple selection; every label is kept at a
+4.5:1 contrast ratio or better. Long labels wrap, shrink, then ellipsize to stay inside their slice.
+
+When a conversion fails, the status line says why in plain words (missing HEIC/AVIF support,
+unsupported codec, password-protected PDF, damaged file); hover **Failed** for the program's own message.
 
 **Settings** (the gear in the header bar) change which modifier opens which wheel (Shift, Ctrl, Alt or
 Super, each on one wheel only), whether results go next to the original or into one folder, and whether
@@ -209,12 +225,13 @@ cargo test -- --ignored --nocapture      # every conversion on real sample files
 | `src/params.rs` | Settings for the tools that ask (trim range, crop, speed…) and their checks |
 | `src/params_ui.rs` | The small window that asks for those settings |
 | `src/backend.rs` | Turns an op into commands, names outputs, runs them off the UI thread |
-| `src/wheel.rs` | The radial menu: state, hit testing, drawing |
+| `src/wheel.rs` | The radial menu: state, hit testing, drawing (Pango, theme palette), accessibility |
+| `src/messages.rs` | Plain-language headlines for converter failures |
 | `src/actions.rs` | The actions wheel: clipboard, copy/move, file manager, terminal |
 | `src/config.rs` | Settings: the JSON file, defaults, modifier assignment |
 | `src/settings_ui.rs` | The Settings window |
 | `src/cli.rs` | The command line: `--convert`, `--tool`, `--list`, `--wheel` |
-| `src/main.rs` | The window, drag and drop, keyboard |
+| `src/main.rs` | The window, drag and drop, keyboard, right-click / long-press |
 | `data/nautilus/`, `data/kio/`, `data/nemo/`, `data/thunar/`, `data/nautilus-scripts/` | File manager menus |
 
 ## Not yet
