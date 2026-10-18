@@ -11,6 +11,8 @@ mod backend;
 mod catalog;
 mod cli;
 mod config;
+mod params;
+mod params_ui;
 mod settings_ui;
 mod wheel;
 
@@ -589,13 +591,29 @@ fn execute(state: &Rc<App>, op: Op, files: Vec<PathBuf>) {
         actions::perform(action, files, &state.window, move |msg| status.set_text(&msg));
         return;
     }
+    // Tools like Trim and Crop ask for their settings first.
+    if let Op::Tool(tool) = op
+        && tool.needs_params()
+    {
+        let weak = Rc::downgrade(state);
+        params_ui::ask(state.window.upcast_ref(), tool, files.clone(), move |params| {
+            if let Some(state) = weak.upgrade() {
+                start_job(&state, op, files, Some(params));
+            }
+        });
+        return;
+    }
+    start_job(state, op, files, None);
+}
 
+/// Adds a line to the activity list and runs `op` off the UI thread.
+fn start_job(state: &Rc<App>, op: Op, files: Vec<PathBuf>, params: Option<params::Params>) {
     let what = if files.len() == 1 {
         files[0].file_name().unwrap_or_default().to_string_lossy().into_owned()
     } else {
         format!("{} files", files.len())
     };
-    let title = gtk::Label::new(Some(&format!("{what} → {}", op.label())));
+    let title = gtk::Label::new(Some(&format!("{what} → {}", op.label().trim_end_matches('…'))));
     title.set_xalign(0.0);
     title.set_hexpand(true);
     title.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
@@ -613,7 +631,7 @@ fn execute(state: &Rc<App>, op: Op, files: Vec<PathBuf>) {
     let state = state.clone();
     let dest = config::get().output_dir;
     glib::spawn_future_local(async move {
-        let result = gio::spawn_blocking(move || backend::run(op, &files, dest.as_deref())).await;
+        let result = gio::spawn_blocking(move || backend::run(op, &files, params.as_ref(), dest.as_deref())).await;
         line.remove(&spinner);
         match result {
             Ok(Ok(outputs)) => {
