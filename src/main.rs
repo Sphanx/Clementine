@@ -85,6 +85,7 @@ fn window(app: &gtk::Application) -> gtk::ApplicationWindow {
         &provider,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
+    gtk::Window::set_default_icon_name(APP_ID);
     let state = build(app);
     STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
     state.window.clone()

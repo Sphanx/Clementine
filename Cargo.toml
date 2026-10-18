@@ -14,7 +14,7 @@ tempfile = "3.27.0"
 
 [package.metadata.deb]
 name = "clementine"
-maintainer = "Sphanx <oguzztrk1@gmail.com>"
+maintainer = "Sphanx <98588426+Sphanx@users.noreply.github.com>"
 copyright = "2026, Sphanx"
 # TODO: license-file / license. The owner has not picked a license yet.
 section = "utils"
@@ -24,7 +24,7 @@ Clementine converts files without uploading them anywhere. Drag a file onto the 
 hold a modifier key, and drop it on a format on the conversion wheel. Conversions run \
 through ffmpeg, ImageMagick, pandoc, LibreOffice, poppler and the archive tools already \
 on your computer."""
-depends = "$auto"
+depends = "$auto, libgtk-4-1 (>= 4.14)"
 recommends = "ffmpeg, imagemagick, pandoc, poppler-utils, zip, unzip"
 suggests = "libreoffice-core, unrar, p7zip-full, ghostscript"
 assets = [
