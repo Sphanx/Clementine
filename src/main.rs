@@ -10,6 +10,7 @@ mod actions;
 mod backend;
 mod catalog;
 mod config;
+mod jobs_ui;
 mod params;
 mod params_ui;
 mod progress;
@@ -179,6 +180,7 @@ fn build(app: &gtk::Application) -> Rc<App> {
     overlay.add_overlay(&area);
     overlay.add_overlay(&chips);
     window.set_child(Some(&overlay));
+    jobs_ui::guard_close(&window);
 
     let state = Rc::new(App {
         window,
@@ -558,59 +560,30 @@ fn execute(state: &Rc<App>, op: Op, files: Vec<PathBuf>) {
     start_job(state, op, files, None);
 }
 
-/// Adds a line to the activity list and runs `op` off the UI thread.
+/// Adds a line to the activity list and runs `op` off the UI thread (see [`jobs_ui`]).
 fn start_job(state: &Rc<App>, op: Op, files: Vec<PathBuf>, params: Option<params::Params>) {
     let what = if files.len() == 1 {
         files[0].file_name().unwrap_or_default().to_string_lossy().into_owned()
     } else {
         format!("{} files", files.len())
     };
-    let title = gtk::Label::new(Some(&format!("{what} → {}", op.label().trim_end_matches('…'))));
-    title.set_xalign(0.0);
-    title.set_hexpand(true);
-    title.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-    let spinner = gtk::Spinner::new();
-    spinner.start();
-    let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    line.set_margin_top(4);
-    line.set_margin_bottom(4);
-    line.set_margin_start(12);
-    line.set_margin_end(12);
-    line.append(&title);
-    line.append(&spinner);
-    state.jobs.prepend(&line);
-
-    let state = state.clone();
-    let dest = config::get().output_dir;
-    glib::spawn_future_local(async move {
-        let result = gio::spawn_blocking(move || backend::run(op, &files, params.as_ref(), dest.as_deref())).await;
-        line.remove(&spinner);
+    let title = format!("{what} → {}", op.label().trim_end_matches('…'));
+    let weak = Rc::downgrade(state);
+    let done = move |result: &jobs_ui::Outcome| {
+        let Some(state) = weak.upgrade() else { return };
         match result {
-            Ok(Ok(outputs)) => {
-                let show = gtk::Button::with_label("Show");
-                show.add_css_class("flat");
-                let shown = outputs.clone();
-                let weak = Rc::downgrade(&state);
-                show.connect_clicked(move |_| {
-                    let Some(state) = weak.upgrade() else { return };
-                    let status = state.status.clone();
-                    actions::perform(catalog::Action::ShowInFiles, shown.clone(), &state.window, move |m| {
-                        status.set_text(&m)
-                    });
-                });
-                line.append(&show);
-                if config::get().add_results_to_shelf {
-                    add_to_shelf(&state, outputs);
-                }
-            }
-            Ok(Err(e)) => {
-                let err = gtk::Label::new(Some("Failed"));
-                err.add_css_class("error");
-                err.set_tooltip_text(Some(&format!("{e:#}")));
-                line.append(&err);
-                state.status.set_text(&format!("{e:#}"));
-            }
-            Err(_) => state.status.set_text("The converter crashed"),
+            Ok(outputs) if config::get().add_results_to_shelf => add_to_shelf(&state, outputs.clone()),
+            Ok(_) => {}
+            Err(e) if progress::is_cancelled(e) => state.status.set_text("Cancelled"),
+            Err(e) => state.status.set_text(&format!("{e:#}")),
         }
-    });
+    };
+    let weak = Rc::downgrade(state);
+    let show = move |outputs: Vec<PathBuf>| {
+        let Some(state) = weak.upgrade() else { return };
+        let status = state.status.clone();
+        actions::perform(catalog::Action::ShowInFiles, outputs, &state.window, move |m| status.set_text(&m));
+    };
+    let finish = jobs_ui::Finish { done: Box::new(done), show: Rc::new(show) };
+    jobs_ui::start(&state.jobs, &title, op, files, params, config::get().output_dir, finish);
 }
