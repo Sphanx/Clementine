@@ -1050,6 +1050,14 @@ pub fn run_with(
     {
         bail!("{} needs settings", op.label());
     }
+    // Absolute from here on: some steps run with another working folder (Zip, archive packing).
+    let files: Vec<PathBuf> = files
+        .iter()
+        .map(|f| std::path::absolute(f).with_context(|| format!("resolving {}", f.display())))
+        .collect::<Result<_>>()?;
+    let dest = dest.map(std::path::absolute).transpose().context("resolving the output folder")?;
+    let dest = dest.as_deref();
+    let files = files.as_slice();
     let scratch = tempfile::Builder::new().prefix("susen-").tempdir()?;
     if let Some(dest) = dest {
         std::fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;

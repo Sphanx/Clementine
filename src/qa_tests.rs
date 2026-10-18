@@ -948,8 +948,8 @@ fn qa_gz_and_tar_gz_extract_differently() {
 
 /// Relative paths (a command line, or a future CLI) must work like absolute ones.
 #[test]
-#[ignore = "BUG: relative inputs break ops that run with a working folder (Zip, archive conversion)"]
-fn bug_relative_paths_work() {
+#[ignore = "slow: runs the converters"]
+fn qa_relative_paths_work() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     // Deep enough that `..`s meant for the test's working folder cannot land back in place.
