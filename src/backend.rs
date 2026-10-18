@@ -183,7 +183,13 @@ fn ffmpeg(input: &Path) -> Cmd {
 /// ffmpeg reading `input` from `start` seconds. Seeking before `-i` is fast, and exact
 /// whenever the streams are re-encoded.
 fn ffmpeg_from(input: &Path, start: f64) -> Cmd {
-    let mut cmd = Cmd::new("ffmpeg").args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
+    ffmpeg_with(input, start, &[])
+}
+
+/// ffmpeg reading `input` from `start` seconds, with `input_flags` placed before `-i`.
+fn ffmpeg_with(input: &Path, start: f64, input_flags: &[&str]) -> Cmd {
+    let mut cmd =
+        Cmd::new("ffmpeg").args(["-hide_banner", "-loglevel", "error", "-nostdin"]).args(input_flags.iter().copied());
     if start > 0.0 {
         cmd = cmd.arg("-ss").arg(trim_number(start));
     }
@@ -236,6 +242,18 @@ fn speed_fps_mode(input: &Path) -> &'static str {
     }
 }
 
+/// A stream copy of `input`'s picture, sound and subtitles into Matroska. MPEG program streams
+/// carry packets without timestamps, which Matroska cannot store, so ffmpeg generates them
+/// (`+genpts`). MP4's own subtitle format has no Matroska equivalent and becomes SRT.
+fn copy_to_mkv(input: &Path, out: &Path) -> Cmd {
+    let cmd = ffmpeg_with(input, 0.0, &["-fflags", "+genpts"]).args(ffmpeg_codec("mkv").iter().copied());
+    let cmd = match canonical(&extension(input)) {
+        "mp4" | "m4v" | "mov" => cmd.args(["-c:s", "srt"]),
+        _ => cmd,
+    };
+    cmd.arg(out)
+}
+
 /// Encoder settings for a conversion target.
 fn ffmpeg_codec(target: &str) -> &'static [&'static str] {
     match target {
@@ -262,7 +280,8 @@ fn ffmpeg_codec(target: &str) -> &'static [&'static str] {
             "-movflags",
             "+faststart",
         ],
-        "mkv" => &["-map", "0", "-c", "copy"],
+        // Matroska takes no data streams (DVD navigation packets, QuickTime timecodes).
+        "mkv" => &["-map", "0:v?", "-map", "0:a?", "-map", "0:s?", "-c", "copy"],
         "webm" => &["-c:v", "libvpx-vp9", "-crf", "32", "-b:v", "0", "-row-mt", "1", "-c:a", "libopus"],
         "avi" => &["-c:v", "mpeg4", "-q:v", "3", "-c:a", "libmp3lame"],
         "gif" => &[
@@ -472,6 +491,7 @@ fn convert_job(input: &Path, target: &'static str, scratch: &Path, names: &mut N
             let frame = if matches!(src.as_str(), "gif" | "tiff") && target != src { "[0]" } else { "" };
             steps.push(Step::Run(Cmd::new(magick()).arg(im_input(input, frame)).arg("-auto-orient").arg(&out)));
         }
+        Kind::Video if target == "mkv" => steps.push(Step::Run(copy_to_mkv(input, &out))),
         Kind::Audio | Kind::Video => {
             steps.push(Step::Run(ffmpeg(input).args(ffmpeg_codec(target).iter().copied()).arg(&out)));
         }
@@ -1278,6 +1298,20 @@ mod tests {
         for file in ["a.avi", "a.wmv", "a.mpg", "a.mpeg", "a.flv"] {
             assert_eq!(mode(file), "vfr", "{file}");
         }
+    }
+
+    #[test]
+    fn mkv_copies_generate_timestamps_and_skip_data_streams() {
+        let args = |file: &str| -> Vec<String> {
+            copy_to_mkv(Path::new(file), Path::new("out.mkv")).args.iter().map(|a| a.to_string_lossy().into()).collect()
+        };
+        let mpg = args("a.mpg");
+        let input = mpg.iter().position(|a| a == "-i").unwrap();
+        assert!(mpg[..input].windows(2).any(|w| w == ["-fflags", "+genpts"]), "{mpg:?}");
+        assert!(!mpg.windows(2).any(|w| w == ["-map", "0"]), "{mpg:?}");
+        assert!(mpg.windows(2).any(|w| w == ["-c", "copy"]), "{mpg:?}");
+        assert!(args("a.mp4").windows(2).any(|w| w == ["-c:s", "srt"]));
+        assert!(!mpg.iter().any(|a| a == "-c:s"));
     }
 
     #[test]

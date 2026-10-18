@@ -657,7 +657,6 @@ fn known_bug(file: &Path, op: Op) -> Option<&'static str> {
     match (name, op) {
         ("i_multi.tiff", Op::Tool(Tool::Resize)) => Some("bug_resize_on_animations_and_multi_page_images"),
         ("a_wma.wma", Op::Tool(Tool::NormalizeAudio)) => Some("bug_normalize_wma"),
-        ("v_mpg.mpg", Op::Convert("mkv")) => Some("bug_mpg_to_mkv"),
         _ => None,
     }
 }
@@ -1407,14 +1406,59 @@ fn speed_keeps_the_asked_length_in_every_video_container() {
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
 
-/// MPG → MKV stream-copies (`-c copy`), and MPEG-PS packets without timestamps cannot be muxed.
+/// MPG → MKV stream-copied packets without timestamps, which Matroska cannot store; ffmpeg now
+/// generates them (`-fflags +genpts`).
 #[test]
-#[ignore = "BUG: MPG to MKV fails (stream copy of packets without timestamps)"]
-fn bug_mpg_to_mkv() {
+#[ignore = "slow: runs the converters"]
+fn mpg_to_mkv() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     let mpg = ff_sample(d, "a.mpg", &["-c:v", "mpeg2video", "-c:a", "mp2"]);
     expect_all_work(vec![(mpg, Op::Convert("mkv"))], d);
+}
+
+/// Every video container → MKV, plus the awkward ones: an MP4 with its own subtitle format, a
+/// QuickTime file with a timecode track and a DVD program stream with navigation packets. Each
+/// copy must decode without an error and keep its length.
+#[test]
+#[ignore = "slow: runs the converters"]
+fn every_video_container_to_mkv() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mut files = video_samples(d);
+    std::fs::write(d.join("t.srt"), "1\n00:00:00,200 --> 00:00:00,800\nHi\n").unwrap();
+    ff(d, &["-i", "v.mp4", "-i", "t.srt", "-map", "0", "-map", "1", "-c", "copy", "-c:s", "mov_text", "subs.mp4"]);
+    ff(d, &["-i", "v.mov", "-timecode", "01:00:00:00", "-c", "copy", "timecode.mov"]);
+    files.push(d.join("subs.mp4"));
+    files.push(d.join("timecode.mov"));
+    files.push(ff_sample(d, "dvd.mpg", &["-target", "pal-dvd", "-s", "128x96"]));
+    let mut failures = Vec::new();
+    for file in files {
+        let name = file.file_name().unwrap().to_string_lossy().into_owned();
+        let outs = match run(Op::Convert("mkv"), std::slice::from_ref(&file), None, None) {
+            Ok(outs) => outs,
+            Err(e) => {
+                failures.push(format!("{name}: {e:#}"));
+                continue;
+            }
+        };
+        let decode = Command::new("ffmpeg")
+            .args(["-v", "error", "-nostdin", "-i"])
+            .arg(&outs[0])
+            .args(["-f", "null", "-"])
+            .output()
+            .unwrap();
+        let (want, got) = (media_duration(&file).unwrap(), media_duration(&outs[0]));
+        if !decode.status.success() || !decode.stderr.is_empty() {
+            failures.push(format!("{name}: does not decode: {}", String::from_utf8_lossy(&decode.stderr)));
+        } else if !got.is_some_and(|g| (g - want).abs() <= 0.1) {
+            failures.push(format!("{name}: {got:?} s, wanted {want:.3}"));
+        } else {
+            println!("ok   {name} → mkv: {:.3} s", got.unwrap());
+        }
+        std::fs::remove_file(&outs[0]).unwrap();
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
 
 // ---------------------------------------------------------------------------------------------
