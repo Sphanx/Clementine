@@ -656,7 +656,6 @@ fn known_bug(file: &Path, op: Op) -> Option<&'static str> {
     let name = file.file_name()?.to_str()?;
     match (name, op) {
         ("i_multi.tiff", Op::Tool(Tool::Resize)) => Some("bug_resize_on_animations_and_multi_page_images"),
-        ("a_wma.wma", Op::Tool(Tool::NormalizeAudio)) => Some("bug_normalize_wma"),
         _ => None,
     }
 }
@@ -1335,14 +1334,41 @@ fn bug_resize_on_animations_and_multi_page_images() {
     );
 }
 
-/// Normalize: `loudnorm` outputs 192 kHz, which the WMA encoder refuses (no `-ar` is given).
+/// Normalize: `loudnorm` outputs 192 kHz, which the WMA encoder refused; the source's rate is
+/// now asked for with `-ar`.
 #[test]
-#[ignore = "BUG: Normalize fails on WMA (loudnorm resamples to 192 kHz)"]
-fn bug_normalize_wma() {
+#[ignore = "slow: runs the converters"]
+fn normalize_wma() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     ff(d, &["-f", "lavfi", "-i", "sine=duration=1", "-c:a", "wmav2", "a.wma"]);
     expect_all_work(vec![(d.join("a.wma"), Op::Tool(Tool::NormalizeAudio))], d);
+}
+
+/// Normalize keeps the sample rate of every audio format it is offered on (Opus is always
+/// 48 kHz), at 44.1 and 22.05 kHz.
+#[test]
+#[ignore = "slow: runs the converters"]
+fn normalize_keeps_the_sample_rate() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mut failures = Vec::new();
+    for rate in ["44100", "22050"] {
+        for ext in ["mp3", "m4a", "wav", "flac", "ogg", "opus", "aiff", "wma", "aac"] {
+            let name = format!("a{rate}.{ext}");
+            ff(d, &["-f", "lavfi", "-i", &format!("sine=duration=1:sample_rate={rate}"), &name]);
+            let file = d.join(&name);
+            let want = backend::sample_rate(&file).unwrap();
+            match run(Op::Tool(Tool::NormalizeAudio), std::slice::from_ref(&file), None, None) {
+                Ok(outs) => match backend::sample_rate(&outs[0]) {
+                    Some(got) if got == want => println!("ok   {name}: {got} Hz"),
+                    got => failures.push(format!("{name}: {got:?} Hz, wanted {want}")),
+                },
+                Err(e) => failures.push(format!("{name}: {e:#}")),
+            }
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
 
 /// Speed…: `-fps_mode passthrough` handed AVI, WMV, MPG and FLV encoders duplicate timestamps

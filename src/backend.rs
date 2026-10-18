@@ -610,7 +610,7 @@ fn pandoc(input: &Path, src: &str, target: &str, out: &Path) -> Cmd {
     cmd.arg("-o").arg(out).arg(input)
 }
 
-/// The settings a tool runs with, and whether durations may be probed (only for a real run;
+/// The settings a tool runs with, and whether durations and sample rates may be probed (only for a real run;
 /// planning for [`missing_programs`] must stay quick and touch no file).
 struct Setup<'a> {
     params: Option<Params>,
@@ -625,6 +625,12 @@ impl Setup<'_> {
             return Ok(1.0);
         }
         media_duration(input).ok_or_else(|| anyhow!("could not read the length of {}", input.display()))
+    }
+
+    /// `input`'s first audio stream's sample rate; 48 kHz when it cannot be read or while only
+    /// planning.
+    fn sample_rate(&self, input: &Path) -> u32 {
+        if self.probe { sample_rate(input) } else { None }.unwrap_or(48_000)
     }
 }
 
@@ -800,7 +806,10 @@ fn tool_job(input: &Path, tool: Tool, setup: &Setup, names: &mut Names) -> Resul
         }
         Tool::NormalizeAudio => {
             let out = names.claim(&dir, &format!("{name} (normalized)"), &ext);
-            steps.push(Step::Run(ffmpeg(input).args(["-af", "loudnorm"]).arg(&out)));
+            // loudnorm works at 192 kHz and outputs that rate, which most encoders refuse (WMA)
+            // or keep for no gain; the source's rate goes back in.
+            let rate = setup.sample_rate(input).to_string();
+            steps.push(Step::Run(ffmpeg(input).args(["-af", "loudnorm", "-ar", &rate]).arg(&out)));
             out
         }
         Tool::CompressPdf => {
@@ -834,6 +843,7 @@ fn tool_job(input: &Path, tool: Tool, setup: &Setup, names: &mut Names) -> Resul
 /// `params` are the settings of a tool that asks for them ([`Tool::needs_params`]). With them,
 /// tools that need a file's length probe it with ffprobe. Without them, a tool that asks is
 /// planned with stand-in settings, only to learn which programs it calls.
+#[cfg(test)]
 pub fn plan(op: Op, files: &[PathBuf], params: Option<&Params>, scratch: &Path) -> Result<Vec<Job>> {
     plan_in(op, files, params, scratch, None)
 }
@@ -845,6 +855,18 @@ pub fn plan_in(
     params: Option<&Params>,
     scratch: &Path,
     dest: Option<&Path>,
+) -> Result<Vec<Job>> {
+    plan_jobs(op, files, params, scratch, dest, true)
+}
+
+/// [`plan_in`]; `probe` false plans without reading any file, only to learn which programs run.
+fn plan_jobs(
+    op: Op,
+    files: &[PathBuf],
+    params: Option<&Params>,
+    scratch: &Path,
+    dest: Option<&Path>,
+    probe: bool,
 ) -> Result<Vec<Job>> {
     // Inputs are claimed up front, so no output can ever be named after one.
     let mut names = Names { taken: files.iter().cloned().collect(), dest: dest.map(Path::to_path_buf) };
@@ -873,7 +895,8 @@ pub fn plan_in(
         Op::Tool(tool) => {
             let setup = Setup {
                 params: params.copied().or_else(|| params::defaults(tool, &Facts::default())),
-                probe: params.is_some(),
+                // A tool that asks is only probed with its real settings.
+                probe: probe && (params.is_some() || !tool.needs_params()),
                 scratch,
             };
             files.iter().map(|f| tool_job(f, tool, &setup, &mut names)).collect()
@@ -884,7 +907,9 @@ pub fn plan_in(
 
 /// The programs `op` would call that are not installed. Empty means it can run.
 pub fn missing_programs(op: Op, files: &[PathBuf]) -> Vec<String> {
-    let Ok(jobs) = plan(op, files, None, Path::new("/nonexistent-scratch")) else { return Vec::new() };
+    let Ok(jobs) = plan_jobs(op, files, None, Path::new("/nonexistent-scratch"), None, false) else {
+        return Vec::new();
+    };
     let mut programs: Vec<String> = jobs
         .iter()
         .flat_map(|j| &j.steps)
@@ -1133,6 +1158,25 @@ pub fn media_duration(path: &Path) -> Option<f64> {
     text.lines().next()?.trim().parse().ok().filter(|d: &f64| d.is_finite() && *d > 0.0)
 }
 
+/// The sample rate of a media file's first audio stream, from ffprobe.
+pub fn sample_rate(path: &Path) -> Option<u32> {
+    let args = [
+        "-v",
+        "error",
+        "-protocol_whitelist",
+        "file",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=sample_rate",
+        "-of",
+        "default=nw=1:nk=1",
+    ]
+    .map(OsStr::new);
+    let text = capture("ffprobe", &[&args[..], &[path.as_os_str()]].concat())?;
+    text.lines().next()?.trim().parse().ok().filter(|r: &u32| *r > 0)
+}
+
 /// An image's width and height as the tools see it: first frame, upright.
 pub fn image_size(path: &Path) -> Option<(u32, u32)> {
     let first = im_input(path, "[0]");
@@ -1312,6 +1356,15 @@ mod tests {
         assert!(mpg.windows(2).any(|w| w == ["-c", "copy"]), "{mpg:?}");
         assert!(args("a.mp4").windows(2).any(|w| w == ["-c:s", "srt"]));
         assert!(!mpg.iter().any(|a| a == "-c:s"));
+    }
+
+    #[test]
+    fn normalize_asks_for_a_sample_rate() {
+        let jobs = plan(Op::Tool(Tool::NormalizeAudio), &[PathBuf::from("/nonexistent/a.wma")], None, Path::new("/s"));
+        let Step::Run(cmd) = &jobs.unwrap()[0].steps[0] else { panic!("no command") };
+        let args: Vec<_> = cmd.args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        // An unreadable file falls back to 48 kHz instead of loudnorm's 192 kHz.
+        assert!(args.windows(2).any(|w| w == ["-ar", "48000"]), "{args:?}");
     }
 
     #[test]
