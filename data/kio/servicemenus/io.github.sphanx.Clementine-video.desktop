@@ -1,0 +1,35 @@
+# Clementine service menu for video (Dolphin / KDE Frameworks 6).
+# See README.md > File managers.
+[Desktop Entry]
+Type=Service
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
+MimeType=video/*;
+Actions=tomp4;towebm;togif;tomp3;compress;
+X-KDE-Priority=TopLevel
+X-KDE-Submenu=Clementine
+X-KDE-Protocols=file
+
+[Desktop Action tomp4]
+Name=Convert to MP4
+Icon=io.github.sphanx.Clementine
+Exec=clementine --convert mp4 --notify -- %F
+
+[Desktop Action towebm]
+Name=Convert to WEBM
+Icon=io.github.sphanx.Clementine
+Exec=clementine --convert webm --notify -- %F
+
+[Desktop Action togif]
+Name=Convert to GIF
+Icon=io.github.sphanx.Clementine
+Exec=clementine --convert gif --notify -- %F
+
+[Desktop Action tomp3]
+Name=Convert to MP3
+Icon=io.github.sphanx.Clementine
+Exec=clementine --convert mp3 --notify -- %F
+
+[Desktop Action compress]
+Name=Compress
+Icon=io.github.sphanx.Clementine
+Exec=clementine --tool compress --notify -- %F

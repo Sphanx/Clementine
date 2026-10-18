@@ -1,0 +1,8 @@
+[Nemo Action]
+Name=Open in Clementine wheel…
+Comment=Choose a conversion on the Clementine wheel
+Exec=clementine --wheel -- %F
+Icon-Name=io.github.sphanx.Clementine
+Selection=notnone
+Extensions=nodirs;
+Dependencies=clementine;
