@@ -576,6 +576,7 @@ fn more_samples(dir: &Path) -> Vec<PathBuf> {
         ("v_avi.avi", &["-c:v", "mpeg4", "-c:a", "libmp3lame"]),
         ("v_wmv.wmv", &["-c:v", "wmv2", "-c:a", "wmav2"]),
         ("v_mpg.mpg", &["-c:v", "mpeg2video", "-c:a", "mp2"]),
+        ("v_mpeg.mpeg", &["-c:v", "mpeg1video", "-c:a", "mp2"]),
         ("v_flv.flv", &["-c:v", "flv1", "-c:a", "libmp3lame", "-ar", "44100"]),
         ("v_m4v.m4v", &["-c:v", "libx264", "-c:a", "aac"]),
     ] {
@@ -1404,6 +1405,58 @@ fn video_samples(d: &Path) -> Vec<PathBuf> {
     .into_iter()
     .map(|(name, codecs)| ff_sample(d, name, codecs))
     .collect()
+}
+
+/// Speed… (extremes), Trim…, Split… and Fade… on every audio and video container: each output
+/// lands within 0.15 s of the length asked, plus the padding the sample's encoder added.
+#[test]
+#[ignore = "slow: runs the converters"]
+fn media_tools_keep_lengths_in_every_container() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let mut files = video_samples(d);
+    for ext in ["mp3", "m4a", "wav", "flac", "ogg", "opus", "aiff", "wma", "aac"] {
+        let name = format!("a.{ext}");
+        ff(d, &["-f", "lavfi", "-i", "sine=duration=1", &name]);
+        files.push(d.join(name));
+    }
+    let mut failures = Vec::new();
+    for file in files {
+        // Every sample holds 1 s; what a container reports beyond that is encoder padding (MP3,
+        // WMA), which a speed change stretches with the rest.
+        let source = media_duration(&file).unwrap();
+        let pad = (source - 1.0).abs();
+        let cases = [
+            (Tool::Speed, Params::Speed(0.25), 4.0, pad * 4.0),
+            (Tool::Speed, Params::Speed(4.0), 0.25, pad),
+            (Tool::Trim, Params::Trim { start: 0.25, end: 0.75 }, 0.5, pad),
+            (Tool::SplitMedia, Params::Split(SplitBy::Parts(2)), source / 2.0, pad),
+            (Tool::FadeAudio, Params::Fade { fade_in: 0.2, fade_out: 0.3 }, source, 0.0),
+        ];
+        for (tool, params, want, pad) in cases {
+            let name = format!("{} {params:?}", file.file_name().unwrap().to_string_lossy());
+            let outs = match run(Op::Tool(tool), std::slice::from_ref(&file), Some(&params), None) {
+                Ok(outs) => outs,
+                Err(e) => {
+                    failures.push(format!("{name}: {e:#}"));
+                    continue;
+                }
+            };
+            // A split gives a folder; its first part is checked.
+            let out = if outs[0].is_dir() {
+                let mut parts: Vec<PathBuf> = std::fs::read_dir(&outs[0]).unwrap().map(|e| e.unwrap().path()).collect();
+                parts.sort();
+                parts[0].clone()
+            } else {
+                outs[0].clone()
+            };
+            match media_duration(&out) {
+                Some(got) if (got - want).abs() <= 0.15 + pad => println!("ok   {name}: {got:.3} s"),
+                got => failures.push(format!("{name}: {got:?} s, wanted {want:.3}")),
+            }
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
 
 /// Speed… at 0.5× and 2× in every video container lands within 0.15 s of the asked length.
