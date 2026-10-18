@@ -1,0 +1,8 @@
+[Nemo Action]
+Name=Convert to JPG (Clementine)
+Comment=Convert the selected images to JPG
+Exec=clementine --convert jpg --notify -- %F
+Icon-Name=io.github.sphanx.Clementine
+Selection=notnone
+Mimetypes=image/*;
+Dependencies=clementine;

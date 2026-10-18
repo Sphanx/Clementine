@@ -78,6 +78,87 @@ Cuts are re-encoded so they land exactly where asked; only PCM audio (WAV, AIFF)
 which is exact and keeps its bit depth. Pages… uses qpdf when installed and poppler otherwise;
 Rotate… needs qpdf.
 
+## From the command line
+
+```sh
+clementine --wheel FILE…               # the window, with the Convert wheel already open (keyboard)
+clementine --convert png FILE…         # convert, print each result's path
+clementine --tool compress FILE…       # run a tool, print each result's path
+clementine --tool trim --start 0:02 --end 0:10 clip.mp4
+clementine --list FILE…                # what the wheels offer for these files
+clementine --help
+```
+
+`--list` prints one option per line as `id<TAB>label`, e.g. `convert:png` tab `PNG`, or `tool:compress` tab `Compress`,
+followed by `<TAB>params` for a tool that takes settings and `<TAB>unavailable: missing gs` when a
+program it needs is not installed. Tool names are the same for every kind of file: `compress` is
+image, video, audio or PDF compression depending on the files, `rotate` turns an image 90° or asks
+`--degrees` for a PDF, `split` splits a PDF into pages or audio/video by `--parts`/`--every`.
+
+Tools that ask for settings in the window (Trim…, Resize…, Crop…, Speed…, Split…, Fade…,
+Thumbnail…, Pages…, Rotate… for PDFs) take them as flags; `clementine --help` lists them. A flag left
+out keeps the dialog's default (resize 50%, split in 2, speed 2×…), and the values are checked the
+same way the dialog checks them. Results go where Settings say. `--notify` also reports the result
+as a desktop notification (through `notify-send`), which is how the file manager menus give feedback.
+Exit status: 0 on success, 1 when a conversion fails, 2 on a usage error. `--wheel` hands the files
+to a running Clementine when there is one.
+
+## File managers
+
+On Wayland nothing can float over every app the way Tangerine does on macOS, so Clementine lives in
+the file manager's right-click menu instead. The .deb installs all of these; each does nothing
+unless its file manager is installed.
+
+| File manager | What you get | Installed to (.deb) | Needs |
+|---|---|---|---|
+| GNOME Files (Nautilus) | **Clementine ▸** Open in Clementine wheel…, Convert to ▸ (the wheel's formats), Tools ▸ | `/usr/share/nautilus-python/extensions/clementine.py` | `python3-nautilus` |
+| Caja (MATE) | the same menu, same file | `/usr/share/caja-python/extensions/clementine.py` | `python3-caja` |
+| Dolphin (KDE) | **Clementine ▸** Open in wheel, Zip, and per type: images → PNG/JPG/WEBP/PDF, audio → MP3/M4A/FLAC/WAV, video → MP4/WEBM/GIF/MP3, PDF → PNG/JPG/TXT, Compress | `/usr/share/kio/servicemenus/io.github.sphanx.Clementine*.desktop` | KDE Frameworks 6 |
+| Nemo (Cinnamon) | Open in Clementine wheel…, Convert to PNG/JPG/MP3/MP4, Compress | `/usr/share/nemo/actions/clementine-*.nemo_action` | — |
+| Thunar (Xfce) | custom actions in a Clementine submenu | not installable: see below | Thunar 4.18+ for the submenu |
+| GNOME Files, no python | Scripts ▸ Clementine opens the wheel | not installable: see below | — |
+
+Restart the file manager after installing (`nautilus -q`, `caja -q`, `nemo -q`); Dolphin picks the
+menus up when it next opens a menu. The Nautilus menu asks `clementine --list` for the selection, so it
+always matches the wheel; Dolphin, Nemo and Thunar menus are fixed lists, and a choice that does not
+fit the selection (PNG on a PNG) ends in a "failed" notification.
+
+**Per-user installs** (from a source checkout, or for Flatpak):
+
+```sh
+# Nautilus extension (or ~/.local/share/caja-python/extensions/ for Caja)
+mkdir -p ~/.local/share/nautilus-python/extensions
+cp data/nautilus/clementine.py ~/.local/share/nautilus-python/extensions/
+# Nautilus script fallback: right-click > Scripts > Clementine
+mkdir -p ~/.local/share/nautilus/scripts
+cp data/nautilus-scripts/Clementine ~/.local/share/nautilus/scripts/
+# Dolphin: user service menus must be executable
+mkdir -p ~/.local/share/kio/servicemenus
+install -m 755 data/kio/servicemenus/*.desktop ~/.local/share/kio/servicemenus/
+# Nemo
+mkdir -p ~/.local/share/nemo/actions
+cp data/nemo/actions/*.nemo_action ~/.local/share/nemo/actions/
+```
+
+**Thunar** keeps every custom action in one per-user file, `~/.config/Thunar/uca.xml`, so no package
+can add to it cleanly. Close Thunar (`thunar -q`) and paste the `<action>` elements from
+`data/thunar/uca.xml` (the .deb ships it as `/usr/share/clementine/thunar/uca.xml`) inside the
+`<actions>` element of yours, or re-create them in *Edit ▸ Configure custom actions…*.
+
+**Flatpak** cannot install anything into the host's file managers. Copy the files as above, then
+point them at the sandbox: the Nautilus/Caja extension and the Nautilus script read
+`CLEMENTINE_COMMAND` (and the extension falls back to `flatpak run io.github.sphanx.Clementine` by
+itself when no `clementine` is on `PATH`); in the Dolphin, Nemo and Thunar files replace
+`clementine ` in each `Exec=`/`<command>` with `flatpak run io.github.sphanx.Clementine `:
+
+```sh
+sed -i 's|Exec=clementine |Exec=flatpak run io.github.sphanx.Clementine |' \
+    ~/.local/share/kio/servicemenus/io.github.sphanx.Clementine*.desktop \
+    ~/.local/share/nemo/actions/clementine-*.nemo_action
+```
+
+The sandbox only sees your home folder, so files elsewhere cannot be converted from the Flatpak.
+
 ## Install
 
 **Debian / Ubuntu (.deb).** Download `clementine_*.deb` from the GitHub releases page, or build it
@@ -132,9 +213,11 @@ cargo test -- --ignored --nocapture      # every conversion on real sample files
 | `src/actions.rs` | The actions wheel: clipboard, copy/move, file manager, terminal |
 | `src/config.rs` | Settings: the JSON file, defaults, modifier assignment |
 | `src/settings_ui.rs` | The Settings window |
+| `src/cli.rs` | The command line: `--convert`, `--tool`, `--list`, `--wheel` |
 | `src/main.rs` | The window, drag and drop, keyboard |
+| `data/nautilus/`, `data/kio/`, `data/nemo/`, `data/thunar/`, `data/nautilus-scripts/` | File manager menus |
 
 ## Not yet
 
 - A visual range picker (waveform / frame strip) for Trim and Crop
-- A global drop target outside the window (possible on X11 only)
+- A global drop target outside the window (possible on X11 only); the file manager menus stand in for it

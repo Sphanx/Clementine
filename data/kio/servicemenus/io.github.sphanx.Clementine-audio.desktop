@@ -1,0 +1,35 @@
+# Clementine service menu for audio (Dolphin / KDE Frameworks 6).
+# See README.md > File managers.
+[Desktop Entry]
+Type=Service
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
+MimeType=audio/*;
+Actions=tomp3;tom4a;toflac;towav;compress;
+X-KDE-Priority=TopLevel
+X-KDE-Submenu=Clementine
+X-KDE-Protocols=file
+
+[Desktop Action tomp3]
+Name=Convert to MP3
+Icon=io.github.sphanx.Clementine
+Exec=clementine --convert mp3 --notify -- %F
+
+[Desktop Action tom4a]
+Name=Convert to M4A
+Icon=io.github.sphanx.Clementine
+Exec=clementine --convert m4a --notify -- %F
+
+[Desktop Action toflac]
+Name=Convert to FLAC
+Icon=io.github.sphanx.Clementine
+Exec=clementine --convert flac --notify -- %F
+
+[Desktop Action towav]
+Name=Convert to WAV
+Icon=io.github.sphanx.Clementine
+Exec=clementine --convert wav --notify -- %F
+
+[Desktop Action compress]
+Name=Compress
+Icon=io.github.sphanx.Clementine
+Exec=clementine --tool compress --notify -- %F

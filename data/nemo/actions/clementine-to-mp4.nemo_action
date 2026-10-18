@@ -1,0 +1,8 @@
+[Nemo Action]
+Name=Convert to MP4 (Clementine)
+Comment=Convert the selected videos to MP4
+Exec=clementine --convert mp4 --notify -- %F
+Icon-Name=io.github.sphanx.Clementine
+Selection=notnone
+Mimetypes=video/*;
+Dependencies=clementine;

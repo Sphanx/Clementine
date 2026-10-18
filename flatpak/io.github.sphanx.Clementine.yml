@@ -16,6 +16,10 @@
 #   - unrar, p7zip, ghostscript: licensing and size; not bundled
 # The sandbox does NOT call host tools through flatpak-spawn.
 #
+# File manager menus (data/nautilus, data/kio, data/nemo, data/thunar) cannot be installed by a
+# Flatpak: they live in the host's file manager. Users copy them by hand and run the app as
+# `flatpak run io.github.sphanx.Clementine --convert png FILE…`; see README.md > File managers.
+#
 # Status: this manifest has been checked for YAML validity and its source URLs and hashes were
 # fetched. It has NOT been run through flatpak-builder end to end; treat a first build as the test.
 
