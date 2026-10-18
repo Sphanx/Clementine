@@ -1548,10 +1548,10 @@ fn qa_cli_fails_cleanly() {
     assert!(bad.is_empty(), "\n{}", bad.join("\n"));
 }
 
+/// Two Susen processes (two file-manager menu clicks, or the CLI next to the window) convert
 /// with LibreOffice at once. Both share `~/.cache/susen/libreoffice`, and without a lock across
 /// processes the second LibreOffice hands its job to the first and exits 1 without a message;
 /// the `flock` on `libreoffice.lock` queues them.
-/// first and exits 1 without a message.
 #[test]
 #[ignore = "slow: runs the converters"]
 fn qa_two_processes_convert_with_libreoffice_at_once() {
