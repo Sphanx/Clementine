@@ -263,6 +263,8 @@ pub fn options(mode: Mode, files: &[PathBuf]) -> Vec<Op> {
         }
         Mode::Tools => {
             let mut ops: Vec<Op> = match common_kind(files) {
+                // SVG is vector: the pixel tools would hand back a PNG under an .svg name.
+                Some(Kind::Image) if files.iter().any(|f| extension(f) == "svg") => Vec::new(),
                 Some(Kind::Image) => {
                     vec![Tool::CompressImage, Tool::Resize, Tool::CropImage, Tool::Rotate90, Tool::StripMetadata]
                 }
@@ -338,6 +340,13 @@ mod tests {
         assert!(options(Mode::Convert, &files).is_empty());
         assert_eq!(options(Mode::Tools, &files), vec![Op::Tool(Tool::Zip)]);
         assert_eq!(options(Mode::Actions, &files).len(), 6);
+    }
+
+    #[test]
+    fn svg_gets_conversions_but_no_pixel_tools() {
+        assert!(options(Mode::Convert, &[p("a.svg")]).contains(&Op::Convert("png")));
+        assert_eq!(options(Mode::Tools, &[p("a.svg")]), vec![Op::Tool(Tool::Zip)]);
+        assert_eq!(options(Mode::Tools, &[p("a.svg"), p("b.png")]), vec![Op::Tool(Tool::Zip)]);
     }
 
     #[test]
