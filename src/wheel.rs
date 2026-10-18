@@ -555,6 +555,12 @@ pub fn draw(area: &gtk::DrawingArea, cr: &cairo::Context, wheel: &Wheel) {
 
 const HELP: &str = "Arrow keys or 1 to 9 choose, Enter runs, Tab switches wheel, Escape cancels.";
 
+/// GTK 4.14 crashes (calls a null function) when announcing through any accessibility
+/// backend but AT-SPI, e.g. with `NO_AT_BRIDGE=1` or `GTK_A11Y=none`, so only AT-SPI is asked.
+fn can_announce(area: &gtk::DrawingArea) -> bool {
+    area.at_context().type_().name() == "GtkAtSpiContext"
+}
+
 /// Shows or hides the wheel's area, keeps its accessible name and description current, and
 /// announces whatever changed (GTK 4.14 `gtk_accessible_announce`).
 pub fn sync(area: &gtk::DrawingArea, wheel: &mut Wheel) {
@@ -568,7 +574,9 @@ pub fn sync(area: &gtk::DrawingArea, wheel: &mut Wheel) {
             gtk::accessible::Property::Label(&wheel.summary()),
             gtk::accessible::Property::Description(&description),
         ]);
-        if let Some(text) = wheel.speech() {
+        if let Some(text) = wheel.speech()
+            && can_announce(area)
+        {
             area.announce(&text, gtk::AccessibleAnnouncementPriority::Medium);
         }
     } else {
