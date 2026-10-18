@@ -144,3 +144,42 @@ fn seven_zip_links_never_survive() {
 fn run_outputs(dir: &Path) -> usize {
     std::fs::read_dir(dir).unwrap().filter(|e| e.as_ref().unwrap().path().is_dir()).count()
 }
+
+#[test]
+fn image_content_cannot_choose_the_decoder() {
+    // An SVG named .png: ImageMagick sniffs the content and would run its SVG/MSVG parser.
+    let (_root, _secret, input) = sandbox();
+    let fake = input.join("photo.png");
+    std::fs::write(&fake, r#"<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><rect width="4" height="4" fill="red"/></svg>"#).unwrap();
+    assert!(run(Op::Convert("jpg"), &[fake], None, None).is_err());
+}
+
+#[test]
+fn svg_cannot_read_local_files_through_coders() {
+    let (_root, secret, input) = sandbox();
+    let svg = |href: &str| {
+        format!(
+            r#"<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="64" height="32"><rect width="64" height="32" fill="white"/>{href}</svg>"#
+        )
+    };
+    let image = format!(r#"<image x="0" y="0" width="64" height="32" xlink:href="text:{}"/>"#, secret.display());
+    std::fs::write(input.join("evil.svg"), svg(&image)).unwrap();
+    std::fs::write(input.join("plain.svg"), svg("")).unwrap();
+    let render = |name: &str| {
+        run(Op::Convert("bmp"), &[input.join(name)], None, None).ok().map(|o| std::fs::read(&o[0]).unwrap())
+    };
+    let plain = render("plain.svg").expect("a plain SVG converts");
+    if let Some(evil) = render("evil.svg") {
+        assert_eq!(evil, plain, "the SVG drew the text of a local file");
+    }
+}
+
+#[test]
+fn magick_refuses_script_and_text_coders() {
+    let (_root, secret, input) = sandbox();
+    for source in [format!("text:{}", secret.display()), format!("msl:{}", secret.display())] {
+        let out = input.join("out.png");
+        let cmd = Cmd::new(magick()).arg(source.clone()).arg(&out);
+        assert!(run_cmd(&cmd).is_err() && !out.exists(), "{source} was read");
+    }
+}

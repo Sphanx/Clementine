@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Clementine's ImageMagick policy, added on top of the system one through
+     MAGICK_CONFIGURE_PATH. Inputs are untrusted downloads: no scripting coders,
+     no reading files or URLs by name from inside an image, no Ghostscript. -->
+<policymap>
+  <policy domain="coder" rights="none" pattern="{MSL,MVG,TEXT,TXT,LABEL,CAPTION,PANGO,URL,HTTP,HTTPS,FTP,FILE,EPHEMERAL,INLINE,SHOW,WIN,X,PLT,PS,PS2,PS3,EPS,EPI,EPSF,EPSI,EPT,XPS,PCL}" />
+  <!-- PDFs are read by poppler, never by ImageMagick; writing one (image to PDF) is fine. -->
+  <policy domain="coder" rights="write" pattern="PDF" />
+  <policy domain="delegate" rights="none" pattern="{gs,ps:alpha,ps:cmyk,ps:color,ps:gray,ps:mono,pcl:color,pcl:cmyk,pcl:mono,xps:color,xps:cmyk,xps:mono,show,win,url}" />
+  <!-- "@file" reads a list of further file names. -->
+  <policy domain="path" rights="none" pattern="@*" />
+</policymap>

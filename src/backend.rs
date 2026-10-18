@@ -120,6 +120,43 @@ fn magick() -> &'static str {
     if has_program("magick") { "magick" } else { "convert" }
 }
 
+/// ImageMagick's name for an input, with its decoder fixed by the extension (`png:/a/b.png`), so
+/// the content of an untrusted file can never pick a different parser. `frame` is `""` or `"[0]"`.
+fn im_input(path: &Path, frame: &str) -> OsString {
+    let ext = extension(path);
+    let coder = match canonical(&ext) {
+        "jpg" => "jpeg",
+        other => other,
+    };
+    let mut s = OsString::from(format!("{coder}:"));
+    s.push(path.as_os_str());
+    s.push(frame);
+    s
+}
+
+/// A folder holding Clementine's `policy.xml`, for `MAGICK_CONFIGURE_PATH`. Written once per run
+/// of the app into a private temporary folder.
+fn magick_policy_dir() -> Option<&'static Path> {
+    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = tempfile::Builder::new().prefix("clementine-magick-").tempdir().ok()?;
+        std::fs::write(dir.path().join("policy.xml"), include_str!("../data/imagemagick/policy.xml")).ok()?;
+        Some(dir.keep())
+    })
+    .as_deref()
+}
+
+/// A [`Command`] for `program`; ImageMagick also gets Clementine's restrictive policy.
+fn command(program: &str) -> Command {
+    let mut c = Command::new(program);
+    if matches!(program, "magick" | "convert")
+        && let Some(dir) = magick_policy_dir()
+    {
+        c.env("MAGICK_CONFIGURE_PATH", dir);
+    }
+    c
+}
+
 fn ffmpeg(input: &Path) -> Cmd {
     ffmpeg_from(input, 0.0)
 }
@@ -355,9 +392,7 @@ fn convert_job(input: &Path, target: &'static str, scratch: &Path, names: &mut N
         Kind::Image => {
             // Only the first frame of an animation or layered file becomes a still.
             let frame = if matches!(src.as_str(), "gif" | "tiff") && target != src { "[0]" } else { "" };
-            let mut source = input.as_os_str().to_owned();
-            source.push(frame);
-            steps.push(Step::Run(Cmd::new(magick()).arg(source).arg("-auto-orient").arg(&out)));
+            steps.push(Step::Run(Cmd::new(magick()).arg(im_input(input, frame)).arg("-auto-orient").arg(&out)));
         }
         Kind::Audio | Kind::Video => {
             steps.push(Step::Run(ffmpeg(input).args(ffmpeg_codec(target).iter().copied()).arg(&out)));
@@ -466,7 +501,7 @@ fn tool_job(input: &Path, tool: Tool, setup: &Setup, names: &mut Names) -> Resul
     let ext = extension(input);
     let mut steps = Vec::new();
     let im = |out: &Path, args: &[&str]| {
-        Step::Run(Cmd::new(magick()).arg(input).arg("-auto-orient").args(args.iter().copied()).arg(out))
+        Step::Run(Cmd::new(magick()).arg(im_input(input, "")).arg("-auto-orient").args(args.iter().copied()).arg(out))
     };
     let out = match tool {
         Tool::CompressImage => {
@@ -737,7 +772,7 @@ pub fn missing_programs(op: Op, files: &[PathBuf]) -> Vec<String> {
 
 fn run_cmd(cmd: &Cmd) -> Result<()> {
     let _lo = (cmd.program == "soffice").then(|| LO_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
-    let mut c = Command::new(&cmd.program);
+    let mut c = command(&cmd.program);
     c.args(&cmd.args).stdin(Stdio::null()).stderr(Stdio::piped());
     if let Some(dir) = &cmd.cwd {
         c.current_dir(dir);
@@ -813,7 +848,7 @@ pub fn run(op: Op, files: &[PathBuf], params: Option<&Params>, dest: Option<&Pat
 
 /// Runs a probe and returns its trimmed stdout, or `None` if it failed.
 fn capture(program: &str, args: &[&OsStr]) -> Option<String> {
-    let out = Command::new(program).args(args).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+    let out = command(program).args(args).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
@@ -826,8 +861,7 @@ pub fn media_duration(path: &Path) -> Option<f64> {
 
 /// An image's width and height as the tools see it: first frame, upright.
 pub fn image_size(path: &Path) -> Option<(u32, u32)> {
-    let mut first = path.as_os_str().to_owned();
-    first.push("[0]");
+    let first = im_input(path, "[0]");
     let args = [
         first.as_os_str(),
         OsStr::new("-auto-orient"),
