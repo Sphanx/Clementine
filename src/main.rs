@@ -12,6 +12,7 @@ mod catalog;
 mod config;
 mod params;
 mod params_ui;
+mod progress;
 mod settings_ui;
 mod wheel;
 
