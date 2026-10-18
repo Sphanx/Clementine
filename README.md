@@ -48,6 +48,32 @@ A slice is grey when a program it needs is missing; hover it to see which.
 | Subtitles: SRT VTT | SRT VTT TXT | ffmpeg, built-in |
 | Archives: ZIP TAR TAR.GZ RAR 7Z | ZIP TAR TAR.GZ | unzip, tar, unrar, 7z |
 
+## Install
+
+**Debian / Ubuntu (.deb).** Download `clementine_*.deb` from the GitHub releases page, or build it
+(see below), then:
+
+```sh
+sudo apt install ./clementine_0.1.0-1_amd64.deb
+```
+
+apt pulls in GTK 4 and recommends the converters (ffmpeg, ImageMagick, pandoc, poppler-utils, zip,
+unzip). LibreOffice, unrar, p7zip and ghostscript are suggested, not installed.
+
+**Flatpak.** The manifest is `flatpak/io.github.sphanx.Clementine.yml`; it is not on Flathub yet.
+
+```sh
+flatpak install --user flathub org.gnome.Platform//51 org.gnome.Sdk//51 \
+    org.freedesktop.Sdk.Extension.rust-stable//26.08
+flatpak-builder --user --install --force-clean build-dir flatpak/io.github.sphanx.Clementine.yml
+```
+
+The Flatpak bundles ffmpeg (with MP3 via lame), pandoc, zip, unzip and poppler-utils. It does **not**
+bundle ImageMagick, LibreOffice, unrar, p7zip or ghostscript, so those conversions stay greyed out
+inside the sandbox. Clementine does not call host programs through `flatpak-spawn`.
+
+**From source.** See *Building*.
+
 ## Building
 
 ```sh
@@ -79,5 +105,4 @@ cargo test -- --ignored --nocapture      # every conversion on real sample files
 ## Not yet
 
 - Trim / crop / split for audio and video (they need a range picker)
-- Flatpak and `.deb` packaging
 - A global drop target outside the window (possible on X11 only)

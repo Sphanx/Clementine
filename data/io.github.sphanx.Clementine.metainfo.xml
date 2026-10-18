@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.sphanx.Clementine</id>
+  <name>Clementine</name>
+  <summary>Offline drag-and-drop file converter</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <!-- TODO: project_license. The owner has not picked a license yet.
+       Add <project_license>SPDX-ID</project_license> here before the first public release. -->
+  <developer id="io.github.sphanx">
+    <name>Sphanx</name>
+  </developer>
+  <description>
+    <p>
+      Clementine converts files without uploading them anywhere. Drag a file onto the window,
+      hold a modifier key, and drop it on a format on the conversion wheel. The result lands
+      next to the original as a new file; an input is never overwritten.
+    </p>
+    <p>
+      Conversions run through tools already on your computer: ffmpeg for audio and video,
+      ImageMagick for images, pandoc and LibreOffice for documents, poppler for PDF pages,
+      and unzip, tar, unrar and 7z for archives. A conversion whose tool is missing is shown
+      greyed out, with the name of the missing program in its tooltip.
+    </p>
+    <ul>
+      <li>Images, audio, video, documents, spreadsheets, slides, subtitles and archives</li>
+      <li>Radial wheels for conversions, tools (compress, resize, rotate, merge, split) and actions</li>
+      <li>Works on Wayland and X11; keyboard navigation for the shelf and the wheels</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">io.github.sphanx.Clementine.desktop</launchable>
+  <url type="homepage">https://github.com/Sphanx/clementine</url>
+  <url type="bugtracker">https://github.com/Sphanx/clementine/issues</url>
+  <categories>
+    <category>Utility</category>
+  </categories>
+  <keywords>
+    <keyword>convert</keyword>
+    <keyword>converter</keyword>
+    <keyword>image</keyword>
+    <keyword>video</keyword>
+    <keyword>audio</keyword>
+    <keyword>pdf</keyword>
+  </keywords>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.1.0" date="2026-10-18">
+      <description>
+        <p>First packaged release: conversion wheel, tools and actions wheels, shelf, and the
+        converters listed above.</p>
+      </description>
+    </release>
+  </releases>
+</component>

@@ -1,0 +1,36 @@
+name: Release
+# Runs on a version tag such as v0.1.0: builds the .deb and attaches it to a GitHub release.
+on:
+  push:
+    tags:
+      - "v*"
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the tag matches Cargo.toml
+        run: |
+          version=$(python3 -c "import tomllib;print(tomllib.load(open('Cargo.toml','rb'))['package']['version'])")
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
+            exit 1
+          fi
+      - name: Install GTK
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+      - name: Build the .deb
+        run: cargo deb
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" target/debian/*.deb \
+            --title "Clementine $GITHUB_REF_NAME" --generate-notes
