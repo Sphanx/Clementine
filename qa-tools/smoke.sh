@@ -6,7 +6,7 @@ QA=$(cd "$(dirname "$0")/.." && pwd)
 SHOTS=$QA/shots; mkdir -p "$SHOTS"
 WORK=$(mktemp -d); export XDG_CONFIG_HOME=$WORK/config XDG_CACHE_HOME=$WORK/cache
 convert -size 64x48 gradient:orange-white "$WORK/photo.png"
-"$QA/target/debug/clementine" "$WORK/photo.png" > "$WORK/log" 2>&1 &
+"$QA/target/debug/susen" "$WORK/photo.png" > "$WORK/log" 2>&1 &
 APP=$!
 sleep 3
 WID=$(xdotool search --pid $APP | tail -1)
