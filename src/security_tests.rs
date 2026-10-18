@@ -237,3 +237,72 @@ fn documents_cannot_embed_local_files() {
         assert!(!names.lines().any(|l| l.contains("media/")), "{target} embedded a local file:\n{names}");
     }
 }
+
+const ODT_WITH_LOAD_MACRO: &str = r#"
+import sys, zipfile
+out, marker = sys.argv[1], sys.argv[2]
+ns = 'xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:script="urn:oasis:names:tc:opendocument:xmlns:script:1.0" xmlns:xlink="http://www.w3.org/1999/xlink"'
+content = f'''<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content {ns} office:version="1.2"><office:scripts><office:event-listeners>
+<script:event-listener script:language="ooo:script" script:event-name="dom:load" xlink:href="vnd.sun.star.script:Standard.Module1.Main?language=Basic&amp;location=document"/>
+</office:event-listeners></office:scripts><office:body><office:text><text:p>hello</text:p></office:text></office:body></office:document-content>'''
+manifest = '''<?xml version="1.0" encoding="UTF-8"?>
+<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.2">
+<manifest:file-entry manifest:full-path="/" manifest:media-type="application/vnd.oasis.opendocument.text"/>
+<manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/>
+<manifest:file-entry manifest:full-path="Basic/script-lc.xml" manifest:media-type="text/xml"/>
+<manifest:file-entry manifest:full-path="Basic/Standard/script-lb.xml" manifest:media-type="text/xml"/>
+<manifest:file-entry manifest:full-path="Basic/Standard/Module1.xml" manifest:media-type="text/xml"/>
+</manifest:manifest>'''
+lc = '''<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE library:libraries PUBLIC "-//OpenOffice.org//DTD OfficeDocument 1.0//EN" "libraries.dtd">
+<library:libraries xmlns:library="http://openoffice.org/2000/library" xmlns:xlink="http://www.w3.org/1999/xlink"><library:library library:name="Standard" library:link="false"/></library:libraries>'''
+lb = '''<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE library:library PUBLIC "-//OpenOffice.org//DTD OfficeDocument 1.0//EN" "library.dtd">
+<library:library xmlns:library="http://openoffice.org/2000/library" library:name="Standard" library:readonly="false" library:passwordprotected="false"><library:element library:name="Module1"/></library:library>'''
+module = f'''<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE script:module PUBLIC "-//OpenOffice.org//DTD OfficeDocument 1.0//EN" "module.dtd">
+<script:module xmlns:script="http://openoffice.org/2000/script" script:name="Module1" script:language="StarBasic">Sub Main
+Open "{marker}" For Output As #1
+Close #1
+End Sub</script:module>'''
+with zipfile.ZipFile(out, 'w') as z:
+    z.writestr(zipfile.ZipInfo('mimetype'), 'application/vnd.oasis.opendocument.text')
+    z.writestr('META-INF/manifest.xml', manifest)
+    z.writestr('content.xml', content)
+    z.writestr('Basic/script-lc.xml', lc)
+    z.writestr('Basic/Standard/script-lb.xml', lb)
+    z.writestr('Basic/Standard/Module1.xml', module)
+"#;
+
+/// Slow (LibreOffice starts): `cargo test -- --ignored`.
+#[test]
+#[ignore]
+fn office_documents_never_run_macros() {
+    if !has_program("soffice") {
+        return;
+    }
+    let (root, _secret, input) = sandbox();
+    let marker = root.path().join("macro-ran");
+    let odt = input.join("letter.odt");
+    py(ODT_WITH_LOAD_MACRO, &[&odt, &marker]);
+    let out = run(Op::Convert("pdf"), std::slice::from_ref(&odt), None, None).expect("the document converts");
+    assert!(out[0].is_file());
+    assert!(!marker.exists(), "a document macro ran during conversion");
+}
+
+#[test]
+fn the_office_profile_pins_macros_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let xcu = dir.path().join("user/registrymodifications.xcu");
+    lock_down_lo_profile(dir.path()).unwrap();
+    // A profile someone loosened is tightened again; other settings are kept.
+    let loose = std::fs::read_to_string(&xcu).unwrap().replace("<value>3</value>", "<value>0</value>").replace(
+        "</oor:items>",
+        "<item oor:path=\"/org.openoffice.Office.Common/Misc\"><prop oor:name=\"Keep\" oor:op=\"fuse\"><value>1</value></prop></item>\n</oor:items>",
+    );
+    std::fs::write(&xcu, loose).unwrap();
+    lock_down_lo_profile(dir.path()).unwrap();
+    let text = std::fs::read_to_string(&xcu).unwrap();
+    assert!(text.contains(r#""MacroSecurityLevel" oor:op="fuse"><value>3</value>"#), "{text}");
+    assert!(text.contains(r#""DisableMacrosExecution" oor:op="fuse"><value>true</value>"#));
+    assert!(text.contains("\"Keep\"") && text.trim_end().ends_with("</oor:items>"));
+    assert_eq!(text.matches("MacroSecurityLevel").count(), 1);
+}

@@ -246,11 +246,7 @@ fn ffmpeg_codec(target: &str) -> &'static [&'static str] {
 /// LibreOffice's profile lives in the user's cache, so it starts warm after the first run.
 /// Two instances on one profile fight, so LibreOffice calls are serialised by [`LO_LOCK`].
 fn soffice(input: &Path, convert_to: &str, outdir: &Path, infilter: Option<&str>) -> Cmd {
-    let cache = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .unwrap_or_else(std::env::temp_dir);
-    let profile = cache.join("clementine").join("libreoffice");
+    let profile = lo_profile();
     let mut cmd = Cmd::new("soffice")
         .arg(format!("-env:UserInstallation=file://{}", profile.display()))
         .args(["--headless", "--norestore"]);
@@ -261,6 +257,54 @@ fn soffice(input: &Path, convert_to: &str, outdir: &Path, infilter: Option<&str>
 }
 
 static LO_LOCK: Mutex<()> = Mutex::new(());
+
+fn lo_profile() -> PathBuf {
+    let cache = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir);
+    cache.join("clementine").join("libreoffice")
+}
+
+/// Settings pinned in Clementine's own LibreOffice profile: documents are untrusted, so their
+/// macros never run, whatever the profile was changed to.
+const LO_LOCKDOWN: &str = r#"<item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="MacroSecurityLevel" oor:op="fuse"><value>3</value></prop></item>
+<item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="DisableMacrosExecution" oor:op="fuse"><value>true</value></prop></item>
+"#;
+
+/// Writes [`LO_LOCKDOWN`] into the profile's `registrymodifications.xcu` before LibreOffice starts.
+/// LibreOffice keeps entries it finds there, so this is a no-op after the first run.
+fn lock_down_lo_profile(profile: &Path) -> Result<()> {
+    let user = profile.join("user");
+    let xcu = user.join("registrymodifications.xcu");
+    let current = std::fs::read_to_string(&xcu).unwrap_or_default();
+    let pinned = |key: &str| {
+        current.lines().any(|l| {
+            l.contains(&format!("\"{key}\""))
+                && l.contains(if key == "MacroSecurityLevel" { "<value>3</value>" } else { "<value>true</value>" })
+        })
+    };
+    if pinned("MacroSecurityLevel") && pinned("DisableMacrosExecution") {
+        return Ok(());
+    }
+    let kept: String = current
+        .lines()
+        .filter(|l| {
+            !l.contains("\"MacroSecurityLevel\"")
+                && !l.contains("\"DisableMacrosExecution\"")
+                && !l.contains("</oor:items>")
+        })
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let head = if kept.contains("<oor:items") {
+        kept
+    } else {
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<oor:items xmlns:oor=\"http://openoffice.org/2001/registry\" xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">\n".to_string()
+    };
+    std::fs::create_dir_all(&user)?;
+    std::fs::write(&xcu, format!("{head}{LO_LOCKDOWN}</oor:items>\n"))?;
+    Ok(())
+}
 
 /// LibreOffice writes `outdir/<input stem>.<ext>`; this converts and moves the result to `to`.
 fn soffice_to(steps: &mut Vec<Step>, input: &Path, convert_to: &str, produced_ext: &str, scratch: &Path, to: PathBuf) {
@@ -808,6 +852,9 @@ pub fn missing_programs(op: Op, files: &[PathBuf]) -> Vec<String> {
 
 fn run_cmd(cmd: &Cmd) -> Result<()> {
     let _lo = (cmd.program == "soffice").then(|| LO_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+    if cmd.program == "soffice" {
+        lock_down_lo_profile(&lo_profile()).context("preparing the LibreOffice profile")?;
+    }
     let mut c = command(&cmd.program);
     c.args(&cmd.args).stdin(Stdio::null()).stderr(Stdio::piped());
     if let Some(dir) = &cmd.cwd {
