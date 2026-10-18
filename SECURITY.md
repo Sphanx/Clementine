@@ -53,9 +53,9 @@ cannot reach the network there.
 - **Local media read by playlists.** ffmpeg's HLS and concat demuxers can still read local
   *media* files (their own extension allowlist and `safe=1` rules apply). Restricting demuxers with
   `-format_whitelist` risks breaking ordinary files and was not done.
-- **SVG external images.** An SVG may reference other local images by path. The policy blocks the
-  dangerous coders, and librsvg refuses files outside the SVG's folder, but ImageMagick's internal
-  MSVG renderer does not restrict plain image paths.
+- **SVG external images.** An SVG may reference other local images by path. SVG is drawn only by
+  rsvg-convert (policy.xml denies ImageMagick's SVG, MSVG and MVG coders), and librsvg refuses
+  files outside the SVG's folder, so only images beside or below the SVG can be pulled in.
 - **LibreOffice linked content.** Link updating on load was not pinned (the setting names and
   values could not be verified here). Headless conversion was not seen to run macros even with
   macro security turned off.
