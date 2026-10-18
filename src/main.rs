@@ -860,3 +860,18 @@ fn start_job(state: &Rc<App>, op: Op, files: Vec<PathBuf>, params: Option<params
     let finish = jobs_ui::Finish { done: Box::new(done), show: Rc::new(show) };
     jobs_ui::start(&state.jobs, &title, op, files, params, config::get().output_dir, finish);
 }
+
+#[cfg(test)]
+mod dnd_tests {
+    use super::*;
+
+    #[test]
+    fn drop_action_is_one_the_source_offers() {
+        use gdk::DragAction as A;
+        // X11: Shift makes a file manager offer move only, Shift+Ctrl link only.
+        assert_eq!(drop_action(A::MOVE), A::MOVE);
+        assert_eq!(drop_action(A::LINK), A::LINK);
+        assert_eq!(drop_action(A::COPY | A::MOVE), A::COPY);
+        assert!(DROP_ACTIONS.contains(A::COPY | A::MOVE | A::LINK));
+    }
+}
