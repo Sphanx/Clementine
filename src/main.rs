@@ -9,6 +9,8 @@
 mod actions;
 mod backend;
 mod catalog;
+mod config;
+mod settings_ui;
 mod wheel;
 
 use std::cell::{Cell, RefCell};
@@ -42,6 +44,7 @@ struct App {
     jobs: gtk::ListBox,
     status: gtk::Label,
     chips: gtk::Box,
+    hint: gtk::Label,
     wheel: RefCell<Wheel>,
     /// Files of the drag hovering the window; empty until GTK has read them.
     drag_files: RefCell<Vec<PathBuf>>,
@@ -99,6 +102,9 @@ fn build(app: &gtk::Application) -> Rc<App> {
     let add = gtk::Button::from_icon_name("list-add-symbolic");
     add.set_tooltip_text(Some("Add files"));
     header.pack_start(&add);
+    let gear = gtk::Button::from_icon_name("emblem-system-symbolic");
+    gear.set_tooltip_text(Some("Settings"));
+    header.pack_end(&gear);
     window.set_titlebar(Some(&header));
 
     let empty = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -108,9 +114,7 @@ fn build(app: &gtk::Application) -> Rc<App> {
     icon.add_css_class("dim");
     let title = gtk::Label::new(Some("Drop files here"));
     title.add_css_class("drop-hint");
-    let sub = gtk::Label::new(Some(
-        "Hold Shift to convert · Ctrl for tools · Alt for actions\nEverything happens on this computer.",
-    ));
+    let sub = gtk::Label::new(None);
     sub.set_justify(gtk::Justification::Center);
     sub.add_css_class("dim");
     empty.append(&icon);
@@ -159,8 +163,8 @@ fn build(app: &gtk::Application) -> Rc<App> {
     chips.set_margin_bottom(18);
     chips.set_can_target(false);
     chips.set_visible(false);
-    for (label, mode) in [("⇧ Convert", Mode::Convert), ("Ctrl Tools", Mode::Tools), ("Alt Actions", Mode::Actions)] {
-        let chip = gtk::Label::new(Some(label));
+    for mode in [Mode::Convert, Mode::Tools, Mode::Actions] {
+        let chip = gtk::Label::new(None);
         chip.add_css_class("chip");
         chip.set_widget_name(mode.title());
         chips.append(&chip);
@@ -182,6 +186,7 @@ fn build(app: &gtk::Application) -> Rc<App> {
         jobs,
         status,
         chips,
+        hint: sub,
         wheel: RefCell::new(Wheel::default()),
         drag_files: RefCell::new(Vec::new()),
         dragging: Cell::new(false),
@@ -196,8 +201,20 @@ fn build(app: &gtk::Application) -> Rc<App> {
         wheel::draw(cr, &state.wheel.borrow(), dark);
     });
 
+    refresh_hints(&state);
     wire_drop(&state);
     wire_keys(&state);
+
+    let weak = Rc::downgrade(&state);
+    gear.connect_clicked(move |_| {
+        let Some(state) = weak.upgrade() else { return };
+        let weak = Rc::downgrade(&state);
+        settings_ui::open(state.window.upcast_ref(), move || {
+            if let Some(state) = weak.upgrade() {
+                refresh_hints(&state);
+            }
+        });
+    });
 
     let weak = Rc::downgrade(&state);
     state.shelf.connect_row_activated(move |_, row| {
@@ -225,14 +242,22 @@ fn build(app: &gtk::Application) -> Rc<App> {
 }
 
 fn mode_for(mods: gdk::ModifierType) -> Option<Mode> {
-    if mods.contains(gdk::ModifierType::SHIFT_MASK) {
-        Some(Mode::Convert)
-    } else if mods.contains(gdk::ModifierType::CONTROL_MASK) {
-        Some(Mode::Tools)
-    } else if mods.contains(gdk::ModifierType::ALT_MASK) {
-        Some(Mode::Actions)
-    } else {
-        None
+    config::get().mode_for(mods)
+}
+
+/// Chip labels and the empty-state hint follow the configured modifier keys.
+fn refresh_hints(state: &App) {
+    let cfg = config::get();
+    state.hint.set_text(&format!("{}\nEverything happens on this computer.", cfg.hint()));
+    let mut child = state.chips.first_child();
+    while let Some(chip) = child {
+        if let (Some(label), Some(mode)) = (
+            chip.downcast_ref::<gtk::Label>(),
+            [Mode::Convert, Mode::Tools, Mode::Actions].into_iter().find(|m| m.title() == chip.widget_name()),
+        ) {
+            label.set_text(&cfg.chip_label(mode));
+        }
+        child = chip.next_sibling();
     }
 }
 
@@ -368,22 +393,16 @@ fn wire_keys(state: &Rc<App>) {
             (w.open, w.keyboard)
         };
         // A modifier tapped while one of our own shelf rows is being dragged.
-        if state.dragging.get() {
-            let mode = match key {
-                gdk::Key::Shift_L | gdk::Key::Shift_R => Some(Mode::Convert),
-                gdk::Key::Control_L | gdk::Key::Control_R => Some(Mode::Tools),
-                gdk::Key::Alt_L | gdk::Key::Alt_R => Some(Mode::Actions),
-                _ => None,
-            };
-            if let Some(mode) = mode {
-                if open {
-                    state.wheel.borrow_mut().set_mode(mode);
-                    state.area.queue_draw();
-                } else {
-                    open_wheel(&state, mode, state.pointer.get(), state.drag_files.borrow().clone(), false);
-                }
-                return glib::Propagation::Stop;
+        if state.dragging.get()
+            && let Some(mode) = config::get().mode_for_key(key)
+        {
+            if open {
+                state.wheel.borrow_mut().set_mode(mode);
+                state.area.queue_draw();
+            } else {
+                open_wheel(&state, mode, state.pointer.get(), state.drag_files.borrow().clone(), false);
             }
+            return glib::Propagation::Stop;
         }
         if !open {
             if key == gdk::Key::Delete {
@@ -542,8 +561,9 @@ fn execute(state: &Rc<App>, op: Op, files: Vec<PathBuf>) {
     state.jobs.prepend(&line);
 
     let state = state.clone();
+    let dest = config::get().output_dir;
     glib::spawn_future_local(async move {
-        let result = gio::spawn_blocking(move || backend::run(op, &files)).await;
+        let result = gio::spawn_blocking(move || backend::run(op, &files, dest.as_deref())).await;
         line.remove(&spinner);
         match result {
             Ok(Ok(outputs)) => {
@@ -559,7 +579,9 @@ fn execute(state: &Rc<App>, op: Op, files: Vec<PathBuf>) {
                     });
                 });
                 line.append(&show);
-                add_to_shelf(&state, outputs);
+                if config::get().add_results_to_shelf {
+                    add_to_shelf(&state, outputs);
+                }
             }
             Ok(Err(e)) => {
                 let err = gtk::Label::new(Some("Failed"));
