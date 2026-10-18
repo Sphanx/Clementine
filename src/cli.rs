@@ -23,6 +23,7 @@ use crate::backend;
 use crate::catalog::{Mode, Op, Tool, canonical, options};
 use crate::config;
 use crate::params::{self, Crop, Params, Resize, SplitBy};
+use crate::progress;
 
 /// The hint passed to `GApplication::open` so the window opens the Convert wheel.
 pub const WHEEL_HINT: &str = "wheel";
@@ -388,7 +389,11 @@ fn run(cmd: Command) -> Next {
         Ok(p) => p,
         Err(e) => return fail(e),
     };
-    match backend::run(op, &files, params.as_ref(), config::get().output_dir.as_deref()) {
+    // Ctrl-C cancels: the running converter is stopped and its unfinished output removed.
+    let cancel = progress::Cancel::new();
+    progress::cancel_on_interrupt(&cancel);
+    let dest = config::get().output_dir;
+    match backend::run_with(op, &files, params.as_ref(), dest.as_deref(), &cancel, &|_| {}) {
         Ok(outputs) => {
             for out in &outputs {
                 println!("{}", out.display());
@@ -398,6 +403,10 @@ fn run(cmd: Command) -> Next {
                 notify_send(&format!("Susen: {}", op.label()), &names.join("\n"));
             }
             Next::Exit(0)
+        }
+        Err(e) if progress::is_cancelled(&e) => {
+            eprintln!("susen: cancelled");
+            Next::Exit(130)
         }
         Err(e) => fail(format!("{e:#}")),
     }
