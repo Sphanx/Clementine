@@ -50,6 +50,15 @@ results are added to the shelf. Changes apply at once and are saved to
 
 A slice is grey when a program it needs is missing; hover it to see which.
 
+**Activity.** Each conversion gets a row with a progress bar and a count such as `2 of 5 · 43%`
+(file 2 of 5, 43% of the whole job). ffmpeg reports how far it has got; other programs only say
+which file and step they are on, so the bar pulses. The **×** button cancels: the running program
+(and anything it started, such as LibreOffice's `soffice.bin`) is stopped, the unfinished file is
+removed, and files already finished are kept. The row then says **Cancelled**, **Failed** (hover for
+why) or offers **Show**. Closing the window while conversions run asks whether to cancel them and
+quit, or keep running. A conversion that ends while the window is in the background sends a
+desktop notification.
+
 ## What it converts
 
 | From | To | Through |
@@ -116,7 +125,8 @@ Thumbnail…, Pages…, Rotate… for PDFs) take them as flags; `susen --help` l
 out keeps the dialog's default (resize 50%, split in 2, speed 2×…), and the values are checked the
 same way the dialog checks them. Results go where Settings say. `--notify` also reports the result
 as a desktop notification (through `notify-send`), which is how the file manager menus give feedback.
-Exit status: 0 on success, 1 when a conversion fails, 2 on a usage error. `--wheel` hands the files
+Exit status: 0 on success, 1 when a conversion fails, 2 on a usage error, 130 when cancelled
+with Ctrl-C (the running converter is stopped and its unfinished output removed). `--wheel` hands the files
 to a running Susen when there is one.
 
 ## File managers
@@ -225,6 +235,8 @@ cargo test -- --ignored --nocapture      # every conversion on real sample files
 | `src/params.rs` | Settings for the tools that ask (trim range, crop, speed…) and their checks |
 | `src/params_ui.rs` | The small window that asks for those settings |
 | `src/backend.rs` | Turns an op into commands, names outputs, runs them off the UI thread |
+| `src/progress.rs` | Progress reports, the cancel token, parsing ffmpeg's `-progress` output |
+| `src/jobs_ui.rs` | Activity rows: progress bar, cancel button, the close-while-running question |
 | `src/wheel.rs` | The radial menu: state, hit testing, drawing (Pango, theme palette), accessibility |
 | `src/messages.rs` | Plain-language headlines for converter failures |
 | `src/actions.rs` | The actions wheel: clipboard, copy/move, file manager, terminal |

@@ -17,6 +17,7 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::catalog::{Kind, Op, Tool, canonical, extension, kind_of};
 use crate::params::{self, Crop, Facts, Params, Resize, atempo_chain, speed_name, split_points, trim_number};
+use crate::progress::{self, Cancel, Cancelled, FfLine, KILL_AFTER, Progress};
 
 /// One external program call.
 #[derive(Debug, Clone)]
@@ -851,33 +852,130 @@ pub fn missing_programs(op: Op, files: &[PathBuf]) -> Vec<String> {
     missing
 }
 
+/// What a running step reports to, and what can stop it.
+struct Ctx<'a> {
+    cancel: &'a Cancel,
+    /// Called with how far the running step has got, when the program says.
+    within: &'a dyn Fn(Option<f64>),
+}
+
+#[cfg(test)]
 fn run_cmd(cmd: &Cmd) -> Result<()> {
+    run_cmd_with(cmd, &Ctx { cancel: &Cancel::new(), within: &|_| {} })
+}
+
+/// Runs `cmd` in its own process group, so a cancel reaches everything it spawns. ffmpeg is asked
+/// for `-progress` on stdout, which is read here against the output's expected length.
+fn run_cmd_with(cmd: &Cmd, ctx: &Ctx) -> Result<()> {
+    use std::io::{BufRead, Read};
+    use std::os::unix::process::CommandExt;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
     let _lo = (cmd.program == "soffice").then(|| LO_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+    if ctx.cancel.is_cancelled() {
+        return Err(Cancelled.into());
+    }
+    let ffmpeg = cmd.program == "ffmpeg" && cmd.stdout.is_none();
+    let expected = if ffmpeg { progress::ffmpeg_output_seconds(&cmd.args, media_duration) } else { None };
     if cmd.program == "soffice" {
         lock_down_lo_profile(&lo_profile()).context("preparing the LibreOffice profile")?;
     }
     let mut c = command(&cmd.program);
-    c.args(&cmd.args).stdin(Stdio::null()).stderr(Stdio::piped());
+    if ffmpeg {
+        c.args(["-progress", "pipe:1", "-nostats"]);
+    }
+    c.args(&cmd.args).stdin(Stdio::null()).stderr(Stdio::piped()).process_group(0);
     if let Some(dir) = &cmd.cwd {
         c.current_dir(dir);
     }
     match &cmd.stdout {
         Some(path) => c.stdout(std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?),
+        None if ffmpeg => c.stdout(Stdio::piped()),
         None => c.stdout(Stdio::null()),
     };
-    let out = c.output().with_context(|| format!("could not start {}", cmd.program))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
+    let mut child = c.spawn().with_context(|| format!("could not start {}", cmd.program))?;
+    let group = child.id() as i32;
+    ctx.cancel.started(group);
+
+    // Both pipes are drained on their own threads so a chatty child never blocks on a full pipe.
+    let mut stderr = child.stderr.take();
+    let err_reader = std::thread::spawn(move || {
+        let mut text = Vec::new();
+        if let Some(e) = stderr.as_mut() {
+            let _ = e.read_to_end(&mut text);
+        }
+        text
+    });
+    let (tx, rx) = mpsc::channel::<String>();
+    if let Some(out) = child.stdout.take() {
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+    } else {
+        drop(tx);
+    }
+
+    let mut cancelled_at: Option<Instant> = None;
+    // Only forward progress is reported, so a bar never steps back.
+    let mut last = -1.0;
+    let mut lines_open = true;
+    let status = loop {
+        if lines_open {
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(line) => {
+                    let within = match progress::parse_ffmpeg_line(&line) {
+                        Some(FfLine::Time(t)) => expected.and_then(|e| progress::time_fraction(t, e)),
+                        Some(FfLine::End) => Some(1.0),
+                        None => continue,
+                    };
+                    if let Some(w) = within.filter(|w| *w > last) {
+                        last = w;
+                        (ctx.within)(Some(w));
+                    }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => lines_open = false,
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if ctx.cancel.is_cancelled() {
+            let at = *cancelled_at.get_or_insert_with(Instant::now);
+            if at.elapsed() >= KILL_AFTER {
+                progress::signal_group(group, libc::SIGKILL);
+            }
+        }
+    };
+    if ctx.cancel.is_cancelled() {
+        // Whatever the child left behind in its group (soffice.bin) goes with it.
+        progress::signal_group(group, libc::SIGKILL);
+    }
+    ctx.cancel.finished();
+    let err = err_reader.join().unwrap_or_default();
+    if ctx.cancel.is_cancelled() {
+        return Err(Cancelled.into());
+    }
+    if !status.success() {
+        let err = String::from_utf8_lossy(&err);
         let tail: Vec<&str> = err.lines().filter(|l| !l.trim().is_empty()).collect();
         let tail = tail[tail.len().saturating_sub(3)..].join(" · ");
-        bail!("{} failed ({}): {}", cmd.program, out.status, tail);
+        bail!("{} failed ({}): {}", cmd.program, status, tail);
     }
     Ok(())
 }
 
-fn run_step(step: &Step) -> Result<()> {
+fn run_step(step: &Step, ctx: &Ctx) -> Result<()> {
     match step {
-        Step::Run(cmd) => run_cmd(cmd),
+        Step::Run(cmd) => run_cmd_with(cmd, ctx),
         Step::MkDir(dir) => Ok(std::fs::create_dir_all(dir)?),
         Step::Move { from, to } => {
             if !from.exists() {
@@ -902,11 +1000,31 @@ fn run_step(step: &Step) -> Result<()> {
     }
 }
 
+/// Whether a step does work worth counting in [`Progress`]; folders and moves are instant.
+fn is_work(step: &Step) -> bool {
+    matches!(step, Step::Run(_) | Step::SubtitleToText { .. })
+}
+
 /// Runs `op` on `files` and returns what it produced. Blocks: call it off the UI thread.
 /// A job that fails leaves nothing behind; earlier, successful jobs are kept.
 /// `params` are the settings of a tool that asks for them. Results go to `dest` (created if
 /// needed) or, when `None`, next to each input.
+#[cfg(test)]
 pub fn run(op: Op, files: &[PathBuf], params: Option<&Params>, dest: Option<&Path>) -> Result<Vec<PathBuf>> {
+    run_with(op, files, params, dest, &Cancel::new(), &|_| {})
+}
+
+/// Like [`run`], reporting [`Progress`] as it goes (on this thread) and stopping when `cancel`
+/// is cancelled. A cancelled run returns [`Cancelled`] (see [`progress::is_cancelled`]): the
+/// running child is killed, the unfinished job's outputs are removed, finished jobs are kept.
+pub fn run_with(
+    op: Op,
+    files: &[PathBuf],
+    params: Option<&Params>,
+    dest: Option<&Path>,
+    cancel: &Cancel,
+    report: &dyn Fn(Progress),
+) -> Result<Vec<PathBuf>> {
     if let Op::Tool(tool) = op
         && tool.needs_params()
         && params.is_none()
@@ -917,15 +1035,34 @@ pub fn run(op: Op, files: &[PathBuf], params: Option<&Params>, dest: Option<&Pat
     if let Some(dest) = dest {
         std::fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
     }
+    let jobs = plan_in(op, files, params, scratch.path(), dest)?;
     let mut produced = Vec::new();
-    for job in plan_in(op, files, params, scratch.path(), dest)? {
-        if let Err(e) = job.steps.iter().try_for_each(run_step) {
+    for (j, job) in jobs.iter().enumerate() {
+        let steps = job.steps.iter().filter(|s| is_work(s)).count();
+        let mut step = 0;
+        let result = job.steps.iter().try_for_each(|s| {
+            if cancel.is_cancelled() {
+                return Err(Cancelled.into());
+            }
+            let at =
+                Progress { job: j, jobs: jobs.len(), step: step.min(steps.saturating_sub(1)), steps, within: None };
+            if is_work(s) {
+                report(at);
+            }
+            let within = |w: Option<f64>| report(Progress { within: w, ..at });
+            run_step(s, &Ctx { cancel, within: &within })?;
+            if is_work(s) {
+                step += 1;
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+        if let Err(e) = result {
             for out in &job.outputs {
                 let _ = if out.is_dir() { std::fs::remove_dir_all(out) } else { std::fs::remove_file(out) };
             }
             return Err(e);
         }
-        produced.extend(job.outputs);
+        produced.extend(job.outputs.iter().cloned());
     }
     Ok(produced)
 }
@@ -1360,6 +1497,113 @@ mod real {
         }
         println!("{ran} ops ran, {} failed", failures.len());
         assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+}
+
+/// Progress and cancellation on real programs: ffmpeg and LibreOffice.
+#[cfg(test)]
+mod real_progress {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    fn sh(program: &str, args: &[&str], cwd: &Path) {
+        let ok = Command::new(program).args(args).current_dir(cwd).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        assert!(ok.is_ok_and(|s| s.success()), "making a sample with {program} {args:?} failed");
+    }
+
+    /// Whether any process's command line mentions `needle`.
+    fn running(needle: &Path) -> bool {
+        let out = Command::new("pgrep").arg("-f").arg(needle).output().unwrap();
+        !out.stdout.is_empty()
+    }
+
+    fn video(dir: &Path, seconds: u32) -> PathBuf {
+        let src = format!("testsrc2=size=640x360:rate=25:duration={seconds}");
+        let tone = format!("sine=duration={seconds}");
+        let args = ["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", &src, "-f", "lavfi", "-i", &tone];
+        sh("ffmpeg", &[&args[..], &["-shortest", "-pix_fmt", "yuv420p", "clip.mp4"]].concat(), dir);
+        dir.join("clip.mp4")
+    }
+
+    #[test]
+    #[ignore]
+    fn ffmpeg_reports_rising_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip = video(dir.path(), 10);
+        let seen = Mutex::new(Vec::new());
+        let outs = run_with(Op::Convert("webm"), &[clip], None, None, &Cancel::new(), &|p| {
+            if let Some(f) = p.overall() {
+                seen.lock().unwrap().push(f);
+            }
+        })
+        .unwrap();
+        assert!(outs[0].metadata().unwrap().len() > 0);
+        let seen = seen.into_inner().unwrap();
+        println!("{} ticks: {seen:?}", seen.len());
+        assert!(seen.len() >= 3, "too few ticks: {seen:?}");
+        assert!(seen.windows(2).all(|w| w[1] > w[0]), "not strictly increasing: {seen:?}");
+        assert!(*seen.last().unwrap() > 0.97, "ended at {:?}", seen.last());
+    }
+
+    #[test]
+    #[ignore]
+    fn cancelling_ffmpeg_stops_it_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip = video(dir.path(), 30);
+        let cancel = Cancel::new();
+        let first = Mutex::new(None);
+        let result = run_with(Op::Convert("webm"), &[clip], None, None, &cancel, &|p| {
+            if p.within.is_some() && !cancel.is_cancelled() {
+                *first.lock().unwrap() = Some(Instant::now());
+                cancel.cancel();
+            }
+        });
+        let took = first.lock().unwrap().expect("no progress tick").elapsed();
+        assert!(result.as_ref().is_err_and(progress::is_cancelled), "{result:?}");
+        assert!(took < Duration::from_secs(3), "cancel took {took:?}");
+        assert!(!dir.path().join("clip.webm").exists(), "partial output left behind");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!running(dir.path()), "ffmpeg still running");
+    }
+
+    #[test]
+    #[ignore]
+    fn cancelling_libreoffice_kills_soffice_bin() {
+        if !has_program("soffice") {
+            println!("skip: no soffice");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let para = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor. ";
+        let md: String = (0..6000).map(|i| format!("## Part {i}\n\n{}\n\n", para.repeat(4))).collect();
+        std::fs::write(dir.path().join("long.md"), md).unwrap();
+        sh("pandoc", &["long.md", "-o", "long.docx"], dir.path());
+        let cancel = Arc::new(Cancel::new());
+        let armed = Mutex::new(false);
+        let was_running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = Instant::now();
+        let result = run_with(Op::Convert("pdf"), &[dir.path().join("long.docx")], None, None, &cancel, &|_| {
+            let mut armed = armed.lock().unwrap();
+            if !*armed {
+                *armed = true;
+                let cancel = cancel.clone();
+                let (was_running, needle) = (was_running.clone(), dir.path().to_path_buf());
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(2500));
+                    was_running.store(running(&needle), std::sync::atomic::Ordering::SeqCst);
+                    cancel.cancel();
+                });
+            }
+        });
+        let took = started.elapsed();
+        println!("cancelled after {took:?}");
+        assert!(was_running.load(std::sync::atomic::Ordering::SeqCst), "soffice was not running when cancelled");
+        assert!(result.as_ref().is_err_and(progress::is_cancelled), "{result:?} after {took:?}");
+        assert!(took < Duration::from_millis(2500 + 3000), "cancel took {took:?}");
+        assert!(!dir.path().join("long.pdf").exists(), "partial output left behind");
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!running(dir.path()), "soffice still running");
     }
 }
 
