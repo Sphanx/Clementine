@@ -10,7 +10,7 @@ jobs:
       - name: Install GTK and the converters
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev ffmpeg imagemagick pandoc poppler-utils zip unzip ghostscript
+          sudo apt-get install -y libgtk-4-dev ffmpeg imagemagick pandoc poppler-utils zip unzip ghostscript qpdf
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
