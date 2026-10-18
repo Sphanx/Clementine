@@ -274,7 +274,13 @@ fn ffmpeg(input: &Path) -> Cmd {
 /// ffmpeg reading `input` from `start` seconds. Seeking before `-i` is fast, and exact
 /// whenever the streams are re-encoded.
 fn ffmpeg_from(input: &Path, start: f64) -> Cmd {
-    let mut cmd = Cmd::new("ffmpeg").args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
+    ffmpeg_with(input, start, &[])
+}
+
+/// ffmpeg reading `input` from `start` seconds, with `input_flags` placed before `-i`.
+fn ffmpeg_with(input: &Path, start: f64, input_flags: &[&str]) -> Cmd {
+    let mut cmd =
+        Cmd::new("ffmpeg").args(["-hide_banner", "-loglevel", "error", "-nostdin"]).args(input_flags.iter().copied());
     if start > 0.0 {
         cmd = cmd.arg("-ss").arg(trim_number(start));
     }
@@ -313,6 +319,32 @@ fn cut(input: &Path, start: f64, len: f64, out: &Path) -> Cmd {
     cmd.arg(out)
 }
 
+/// How Speed… hands its retimed frames to the encoder.
+///
+/// Passthrough keeps every frame at its new time; the default constant frame rate drops or
+/// repeats frames and lands up to a few frames off the asked length. AVI, WMV, MPEG and FLV
+/// encoders count time in whole frames of the source rate, though, so a sped-up clip gives them
+/// two frames in one tick and they stop with "Invalid pts". Variable frame rate drops those
+/// extra frames instead (measured: within 0.11 s of the asked length from 0.25× to 4×).
+fn speed_fps_mode(input: &Path) -> &'static str {
+    match canonical(&extension(input)) {
+        "avi" | "wmv" | "mpg" | "mpeg" | "flv" => "vfr",
+        _ => "passthrough",
+    }
+}
+
+/// A stream copy of `input`'s picture, sound and subtitles into Matroska. MPEG program streams
+/// carry packets without timestamps, which Matroska cannot store, so ffmpeg generates them
+/// (`+genpts`). MP4's own subtitle format has no Matroska equivalent and becomes SRT.
+fn copy_to_mkv(input: &Path, out: &Path) -> Cmd {
+    let cmd = ffmpeg_with(input, 0.0, &["-fflags", "+genpts"]).args(ffmpeg_codec("mkv").iter().copied());
+    let cmd = match canonical(&extension(input)) {
+        "mp4" | "m4v" | "mov" => cmd.args(["-c:s", "srt"]),
+        _ => cmd,
+    };
+    cmd.arg(out)
+}
+
 /// Encoder settings for a conversion target.
 fn ffmpeg_codec(target: &str) -> &'static [&'static str] {
     match target {
@@ -339,7 +371,8 @@ fn ffmpeg_codec(target: &str) -> &'static [&'static str] {
             "-movflags",
             "+faststart",
         ],
-        "mkv" => &["-map", "0", "-c", "copy"],
+        // Matroska takes no data streams (DVD navigation packets, QuickTime timecodes).
+        "mkv" => &["-map", "0:v?", "-map", "0:a?", "-map", "0:s?", "-c", "copy"],
         "webm" => &["-c:v", "libvpx-vp9", "-crf", "32", "-b:v", "0", "-row-mt", "1", "-c:a", "libopus"],
         "avi" => &["-c:v", "mpeg4", "-q:v", "3", "-c:a", "libmp3lame"],
         "gif" => &[
@@ -593,6 +626,7 @@ fn convert_job(input: &Path, target: &'static str, scratch: &Path, names: &mut N
             let frame = if target != src { "[0]" } else { "" };
             magick_steps(&mut steps, input, frame, &["-auto-orient".into()], &out, scratch);
         }
+        Kind::Video if target == "mkv" => steps.push(Step::Run(copy_to_mkv(input, &out))),
         Kind::Audio | Kind::Video => {
             steps.push(Step::Run(ffmpeg(input).args(ffmpeg_codec(target).iter().copied()).arg(&out)));
         }
@@ -714,7 +748,7 @@ fn pandoc(input: &Path, src: &str, target: &str, out: &Path) -> Cmd {
     cmd.arg("-o").arg(out).arg(input)
 }
 
-/// The settings a tool runs with, and whether durations may be probed (only for a real run;
+/// The settings a tool runs with, and whether durations and sample rates may be probed (only for a real run;
 /// planning for [`missing_programs`] must stay quick and touch no file).
 struct Setup<'a> {
     params: Option<Params>,
@@ -729,6 +763,12 @@ impl Setup<'_> {
             return Ok(1.0);
         }
         media_duration(input).ok_or_else(|| anyhow!("could not read the length of {}", input.display()))
+    }
+
+    /// `input`'s first audio stream's sample rate; 48 kHz when it cannot be read or while only
+    /// planning.
+    fn sample_rate(&self, input: &Path) -> u32 {
+        if self.probe { sample_rate(input) } else { None }.unwrap_or(48_000)
     }
 }
 
@@ -854,12 +894,10 @@ fn tool_job(input: &Path, tool: Tool, setup: &Setup, names: &mut Names) -> Resul
             let out = names.claim(&dir, &format!("{name} ({})", speed_name(f)), &ext)?;
             let mut cmd = ffmpeg(input);
             if kind_of(input) == Kind::Video {
-                // Passthrough keeps every frame at its new time; the default constant frame rate
-                // drops or repeats frames and lands up to a few frames off the asked length.
                 cmd = cmd
                     .arg("-filter:v")
                     .arg(format!("setpts=PTS/{}", trim_number(f)))
-                    .args(["-fps_mode", "passthrough"]);
+                    .args(["-fps_mode", speed_fps_mode(input)]);
             }
             cmd = cmd.arg("-filter:a").arg(atempo_chain(f)).args(reencode(input).iter().copied());
             steps.push(Step::Run(cmd.arg(&out)));
@@ -917,7 +955,10 @@ fn tool_job(input: &Path, tool: Tool, setup: &Setup, names: &mut Names) -> Resul
         }
         Tool::NormalizeAudio => {
             let out = names.claim(&dir, &format!("{name} (normalized)"), &ext)?;
-            steps.push(Step::Run(ffmpeg(input).args(["-af", "loudnorm"]).arg(&out)));
+            // loudnorm works at 192 kHz and outputs that rate, which most encoders refuse (WMA)
+            // or keep for no gain; the source's rate goes back in.
+            let rate = setup.sample_rate(input).to_string();
+            steps.push(Step::Run(ffmpeg(input).args(["-af", "loudnorm", "-ar", &rate]).arg(&out)));
             out
         }
         Tool::CompressPdf => {
@@ -955,11 +996,13 @@ fn tool_job(input: &Path, tool: Tool, setup: &Setup, names: &mut Names) -> Resul
 /// `params` are the settings of a tool that asks for them ([`Tool::needs_params`]). With them,
 /// tools that need a file's length probe it with ffprobe. Without them, a tool that asks is
 /// planned with stand-in settings, only to learn which programs it calls.
+#[cfg(test)]
 pub fn plan(op: Op, files: &[PathBuf], params: Option<&Params>, scratch: &Path) -> Result<Vec<Job>> {
     plan_in(op, files, params, scratch, None)
 }
 
 /// Like [`plan`], with every output placed in `dest` instead of next to its input.
+#[cfg(test)]
 pub fn plan_in(
     op: Op,
     files: &[PathBuf],
@@ -967,7 +1010,7 @@ pub fn plan_in(
     scratch: &Path,
     dest: Option<&Path>,
 ) -> Result<Vec<Job>> {
-    plan_names(op, files, params, scratch, &mut names_for(files, dest, false))
+    plan_jobs(op, files, params, scratch, &mut names_for(files, dest, false), true)
 }
 
 /// Inputs are claimed up front, so no output can ever be named after one.
@@ -975,12 +1018,15 @@ fn names_for(files: &[PathBuf], dest: Option<&Path>, reserve: bool) -> Names {
     Names { taken: files.iter().cloned().collect(), dest: dest.map(Path::to_path_buf), reserve, created: Vec::new() }
 }
 
-fn plan_names(
+/// [`plan_in`] with these `names`; `probe` false plans without reading any file, only to learn
+/// which programs run.
+fn plan_jobs(
     op: Op,
     files: &[PathBuf],
     params: Option<&Params>,
     scratch: &Path,
     names: &mut Names,
+    probe: bool,
 ) -> Result<Vec<Job>> {
     let first = files.first().ok_or_else(|| anyhow!("nothing selected"))?;
     match op {
@@ -1012,7 +1058,8 @@ fn plan_names(
         Op::Tool(tool) => {
             let setup = Setup {
                 params: params.copied().or_else(|| params::defaults(tool, &Facts::default())),
-                probe: params.is_some(),
+                // A tool that asks is only probed with its real settings.
+                probe: probe && (params.is_some() || !tool.needs_params()),
                 scratch,
             };
             files.iter().map(|f| tool_job(f, tool, &setup, names)).collect()
@@ -1023,7 +1070,11 @@ fn plan_names(
 
 /// The programs `op` would call that are not installed. Empty means it can run.
 pub fn missing_programs(op: Op, files: &[PathBuf]) -> Vec<String> {
-    let Ok(jobs) = plan(op, files, None, Path::new("/nonexistent-scratch")) else { return Vec::new() };
+    let Ok(jobs) =
+        plan_jobs(op, files, None, Path::new("/nonexistent-scratch"), &mut names_for(files, None, false), false)
+    else {
+        return Vec::new();
+    };
     let mut programs: Vec<String> = jobs
         .iter()
         .flat_map(|j| &j.steps)
@@ -1260,7 +1311,7 @@ pub fn run_with(
         std::fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
     }
     let mut names = names_for(files, dest, true);
-    let jobs = match plan_names(op, files, params, scratch.path(), &mut names) {
+    let jobs = match plan_jobs(op, files, params, scratch.path(), &mut names, true) {
         Ok(jobs) => jobs,
         Err(e) => {
             names.release();
@@ -1325,6 +1376,25 @@ pub fn media_duration(path: &Path) -> Option<f64> {
             .map(OsStr::new);
     let text = capture("ffprobe", &[&args[..], &[path.as_os_str()]].concat())?;
     text.lines().next()?.trim().parse().ok().filter(|d: &f64| d.is_finite() && *d > 0.0)
+}
+
+/// The sample rate of a media file's first audio stream, from ffprobe.
+pub fn sample_rate(path: &Path) -> Option<u32> {
+    let args = [
+        "-v",
+        "error",
+        "-protocol_whitelist",
+        "file",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=sample_rate",
+        "-of",
+        "default=nw=1:nk=1",
+    ]
+    .map(OsStr::new);
+    let text = capture("ffprobe", &[&args[..], &[path.as_os_str()]].concat())?;
+    text.lines().next()?.trim().parse().ok().filter(|r: &u32| *r > 0)
 }
 
 /// An image's width and height as the tools see it: first frame, upright.
@@ -1487,6 +1557,44 @@ mod tests {
         assert!(mp4.windows(2).any(|w| w == ["-ss", "1.5"]) && mp4.windows(2).any(|w| w == ["-t", "2.5"]), "{mp4:?}");
         assert!(mp4.iter().any(|a| a == "libx264") && !mp4.iter().any(|a| a == "copy"), "{mp4:?}");
         assert!(mp4.last().unwrap().ends_with("a (trimmed).mp4"));
+    }
+
+    #[test]
+    fn speed_drops_extra_frames_only_where_the_encoder_counts_whole_frames() {
+        let mode = |file: &str| {
+            let args = args_of(Op::Tool(Tool::Speed), file, Params::Speed(2.0));
+            let at = args.iter().position(|a| a == "-fps_mode").expect("no -fps_mode");
+            args[at + 1].clone()
+        };
+        for file in ["a.mp4", "a.m4v", "a.mov", "a.mkv", "a.webm"] {
+            assert_eq!(mode(file), "passthrough", "{file}");
+        }
+        for file in ["a.avi", "a.wmv", "a.mpg", "a.mpeg", "a.flv"] {
+            assert_eq!(mode(file), "vfr", "{file}");
+        }
+    }
+
+    #[test]
+    fn mkv_copies_generate_timestamps_and_skip_data_streams() {
+        let args = |file: &str| -> Vec<String> {
+            copy_to_mkv(Path::new(file), Path::new("out.mkv")).args.iter().map(|a| a.to_string_lossy().into()).collect()
+        };
+        let mpg = args("a.mpg");
+        let input = mpg.iter().position(|a| a == "-i").unwrap();
+        assert!(mpg[..input].windows(2).any(|w| w == ["-fflags", "+genpts"]), "{mpg:?}");
+        assert!(!mpg.windows(2).any(|w| w == ["-map", "0"]), "{mpg:?}");
+        assert!(mpg.windows(2).any(|w| w == ["-c", "copy"]), "{mpg:?}");
+        assert!(args("a.mp4").windows(2).any(|w| w == ["-c:s", "srt"]));
+        assert!(!mpg.iter().any(|a| a == "-c:s"));
+    }
+
+    #[test]
+    fn normalize_asks_for_a_sample_rate() {
+        let jobs = plan(Op::Tool(Tool::NormalizeAudio), &[PathBuf::from("/nonexistent/a.wma")], None, Path::new("/s"));
+        let Step::Run(cmd) = &jobs.unwrap()[0].steps[0] else { panic!("no command") };
+        let args: Vec<_> = cmd.args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        // An unreadable file falls back to 48 kHz instead of loudnorm's 192 kHz.
+        assert!(args.windows(2).any(|w| w == ["-ar", "48000"]), "{args:?}");
     }
 
     #[test]
